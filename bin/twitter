@@ -1,0 +1,1381 @@
+#!/usr/bin/env python3
+"""twitter — Terminal client for X/Twitter.
+
+Mirrors the requests that the web client (x.com) makes, using auth tokens
+extracted from a logged-in qutebrowser-mnemo session. From Twitter's servers'
+perspective, this is indistinguishable from normal browser usage.
+
+No API keys. No paid tiers.
+
+Usage:
+    twitter timeline            Home feed
+    twitter search "query"      Search tweets
+    twitter tweet <id_or_url>   View a single tweet
+    twitter profile @user       View a user's profile
+    twitter post "text"         Post a tweet
+    twitter like <id_or_url>    Like a tweet
+    twitter help [command]      Detailed help
+"""
+
+import sys
+import os
+import re
+
+# Resolve symlinks so imports work from ~/.local/bin/twitter
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+sys.path.insert(0, PROJECT_ROOT)
+
+import argparse
+import json
+
+from lib.api import graphql_get, graphql_post, rest_get, rest_post
+from lib.parse import parse_timeline_entries, parse_tweet
+from lib.format import format_timeline, format_tweet, format_json
+
+
+# ─── GraphQL Query Hashes ─────────────────────────────────
+# Extracted from client-web/main.*.js bundle on 2026-03-01.
+# These change when Twitter deploys new code. See README.md
+# for how to re-extract them.
+
+Q = {
+    "HomeTimeline":         "_J734qKR-wyeEf6vCZ1mfQ",
+    "HomeLatestTimeline":   "csRxUH5ocwnJtPnB3-wr4g",
+    "CreateTweet":          "y362cgN7cwMppu6Hy3JzrQ",
+    "DeleteTweet":          "nxpZCY2K-I6QoFHAHeojFQ",
+    "FavoriteTweet":        "lI07N6Otwv1PhnEgXILM7A",
+    "UnfavoriteTweet":      "ZYKSe-w7KEslx3JhSIk5LA",
+    "CreateRetweet":        "mbRO74GrOvSfRcJnlMapnQ",
+    "DeleteRetweet":        "ZyZigVsNiFO6v1dEks1eWg",
+    "CreateBookmark":       "aoDbu3RHznuiSkQ9aNM67Q",
+    "DeleteBookmark":       "Wlmlj2-xzyS1GN3a6cj-mQ",
+    "TweetDetail":          "ShZ7Ptnc5jM_23VVusteFw",
+    "TweetResultByRestId":  "oSBAzPwnB3u5R9KqxACO3Q",
+    "SearchTimeline":       "9AW3D-T7t9Vkvfdmq2L-iQ",
+    "UserByScreenName":     "pLsOiyHJ1eFwPJlNmLp4Bg",
+    "UserTweets":           "LhtwFV9WwCOurTanx8NNfg",
+    "UserTweetsAndReplies": "9ESiiRo8Mhb_jqNIxduCgA",
+    "Followers":            "W16HbbxU_8PjA_nE2JCr9g",
+    "Following":            "ILoifaG-s7J3wWLd29oMSw",
+    "Likes":                "W9r1yWJ5e9mGz6HMDHe8Vg",
+    "NotificationsTimeline":"2yjiL84hBkOVpzJkkix6Mw",
+    "Bookmarks":            "VFdMm9iVZxlU6hD86gfW_A",
+    "ExplorePage":          "LERJigZ3fJPNFrouClO-RQ",
+    "GenericTimelineById":  "JuyfK9IWpMEuu8K37e8N8Q",
+}
+
+
+# ─── Helpers ───────────────────────────────────────────────
+
+
+def _parse_tweet_ref(ref):
+    """Parse a tweet reference (URL or bare ID) into a tweet ID string.
+
+    Accepts:
+        https://x.com/user/status/1234567890
+        https://twitter.com/user/status/1234567890
+        1234567890
+
+    Returns the bare ID string, or None if unparseable.
+    """
+    if not ref:
+        return None
+    m = re.search(r"/status/(\d+)", ref)
+    if m:
+        return m.group(1)
+    if ref.isdigit():
+        return ref
+    return None
+
+
+def _compact_num(n):
+    """Format numbers compactly: 1500 → 1.5K, 2300000 → 2.3M."""
+    try:
+        n = int(n)
+    except (ValueError, TypeError):
+        return str(n)
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}K"
+    return str(n)
+
+
+def _require_tweet_ref(ref):
+    """Parse a tweet ref or exit with error."""
+    tweet_id = _parse_tweet_ref(ref)
+    if not tweet_id:
+        print(f"Error: invalid tweet reference: {ref}", file=sys.stderr)
+        print("Expected a tweet URL or numeric ID.", file=sys.stderr)
+        sys.exit(1)
+    return tweet_id
+
+
+# Cache user ID lookups within a single invocation
+_user_id_cache = {}
+
+
+def _resolve_user_id(screen_name):
+    """Resolve a @username to a numeric user ID.
+
+    Caches results for the lifetime of the process.
+    Returns (user_id, user_result) tuple.
+    """
+    screen_name = screen_name.lstrip("@")
+    if screen_name in _user_id_cache:
+        return _user_id_cache[screen_name]
+
+    data = graphql_get(
+        Q["UserByScreenName"], "UserByScreenName",
+        {"screen_name": screen_name, "withSafetyModeUserFields": True},
+    )
+    user_result = data.get("data", {}).get("user", {}).get("result", {})
+    if not user_result or not user_result.get("rest_id"):
+        print(f"Error: user @{screen_name} not found.", file=sys.stderr)
+        sys.exit(1)
+
+    user_id = user_result["rest_id"]
+    _user_id_cache[screen_name] = (user_id, user_result)
+    return user_id, user_result
+
+
+# ─── Commands ──────────────────────────────────────────────
+
+
+def cmd_timeline(args):
+    """Fetch and display the home timeline."""
+    variables = {
+        "count": args.count,
+        "includePromotedContent": False,
+        "requestContext": "launch",
+        "withCommunity": True,
+    }
+    if args.cursor:
+        variables["cursor"] = args.cursor
+
+    op = "HomeLatestTimeline" if args.latest else "HomeTimeline"
+    data = graphql_get(Q[op], op, variables)
+
+    entries = data["data"]["home"]["home_timeline_urt"]["instructions"][0]["entries"]
+    tweets, cursors = parse_timeline_entries(entries)
+
+    if args.json:
+        print(format_json(tweets))
+    else:
+        print(format_timeline(tweets, cursors))
+
+
+def cmd_post(args):
+    """Post a new tweet, optionally as a reply or quote."""
+    text = " ".join(args.text)
+    if not text:
+        print("Error: tweet text is required.", file=sys.stderr)
+        sys.exit(1)
+
+    variables = {
+        "tweet_text": text,
+        "dark_request": False,
+        "media": {"media_entities": [], "possibly_sensitive": False},
+        "semantic_annotation_ids": [],
+    }
+
+    if args.reply:
+        tweet_id = _require_tweet_ref(args.reply)
+        variables["reply"] = {
+            "in_reply_to_tweet_id": tweet_id,
+            "exclude_reply_user_ids": [],
+        }
+
+    if args.quote:
+        tweet_id = _require_tweet_ref(args.quote)
+        variables["attachment_url"] = f"https://x.com/i/status/{tweet_id}"
+
+    data = graphql_post(Q["CreateTweet"], "CreateTweet", variables)
+
+    result = (
+        data.get("data", {})
+        .get("create_tweet", {})
+        .get("tweet_results", {})
+        .get("result", {})
+    )
+    tweet = parse_tweet(result)
+
+    # Check for errors in the response
+    errors = data.get("errors", [])
+    if errors:
+        for err in errors:
+            print(f"Error: {err.get('message', 'Unknown error')}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.json:
+        print(format_json(tweet or data))
+    elif tweet:
+        print("Posted:")
+        print(format_tweet(tweet))
+    else:
+        # Fallback: try to extract tweet ID from raw response even if
+        # parse_tweet couldn't build a full tweet dict.
+        fallback_id = (
+            data.get("data", {})
+            .get("create_tweet", {})
+            .get("tweet_results", {})
+            .get("result", {})
+            .get("rest_id")
+        )
+        if fallback_id:
+            print(f"Posted: https://x.com/i/status/{fallback_id}")
+        else:
+            print("Tweet posted (could not parse response)")
+
+
+def cmd_reply(args):
+    """Reply to a tweet. Convenience wrapper around cmd_post."""
+    args.reply = args.tweet
+    args.quote = None
+    cmd_post(args)
+
+
+def cmd_tweet(args):
+    """View a single tweet by ID or URL."""
+    tweet_id = _require_tweet_ref(args.tweet)
+
+    variables = {
+        "tweetId": tweet_id,
+        "withCommunity": True,
+        "includePromotedContent": False,
+        "withVoice": True,
+    }
+
+    data = graphql_get(Q["TweetResultByRestId"], "TweetResultByRestId", variables)
+    result = data.get("data", {}).get("tweetResult", {}).get("result")
+    tweet = parse_tweet(result)
+
+    if args.json:
+        print(format_json(tweet or data))
+    elif tweet:
+        print(format_tweet(tweet))
+    else:
+        print("Tweet not found or could not be parsed.")
+
+
+def cmd_search(args):
+    """Search tweets by keyword, hashtag, or advanced query."""
+    query = " ".join(args.query)
+    if not query:
+        print("Error: search query is required.", file=sys.stderr)
+        sys.exit(1)
+
+    variables = {
+        "rawQuery": query,
+        "count": args.count,
+        "querySource": "typed_query",
+        "product": "Latest" if args.latest else "Top",
+    }
+    if args.cursor:
+        variables["cursor"] = args.cursor
+
+    data = graphql_get(Q["SearchTimeline"], "SearchTimeline", variables)
+
+    instructions = (
+        data.get("data", {})
+        .get("search_by_raw_query", {})
+        .get("search_timeline", {})
+        .get("timeline", {})
+        .get("instructions", [])
+    )
+
+    entries = []
+    for inst in instructions:
+        if inst.get("type") == "TimelineAddEntries":
+            entries = inst.get("entries", [])
+            break
+
+    tweets, cursors = parse_timeline_entries(entries)
+
+    if args.json:
+        print(format_json(tweets))
+    else:
+        if not tweets:
+            print(f"No results for: {query}")
+        else:
+            print(format_timeline(tweets, cursors))
+
+
+def cmd_profile(args):
+    """View a user's profile info."""
+    screen_name = args.user.lstrip("@")
+
+    variables = {"screen_name": screen_name, "withSafetyModeUserFields": True}
+
+    data = graphql_get(Q["UserByScreenName"], "UserByScreenName", variables)
+    user_result = data.get("data", {}).get("user", {}).get("result", {})
+
+    if not user_result:
+        print(f"User @{screen_name} not found.")
+        return
+
+    if args.json:
+        print(format_json(user_result))
+        return
+
+    user_core = user_result.get("core", {})
+    user_legacy = user_result.get("legacy", {})
+    bio = (
+        user_result.get("profile_bio", {}).get("description", "")
+        or user_legacy.get("description", "")
+    )
+    location = (
+        user_result.get("location", {}).get("location", "")
+        or user_legacy.get("location", "")
+    )
+
+    name = user_core.get("name") or user_legacy.get("name", "?")
+    handle = user_core.get("screen_name") or user_legacy.get("screen_name", "?")
+    verified = user_result.get("is_blue_verified", False)
+
+    followers = user_legacy.get("followers_count", 0)
+    following = user_legacy.get("friends_count", 0)
+    tweets_count = user_legacy.get("statuses_count", 0)
+    created = user_core.get("created_at", "")
+
+    v_mark = " ✓" if verified else ""
+    print(f"@{handle} ({name}){v_mark}")
+    if bio:
+        print(f"  {bio}")
+    if location:
+        print(f"  📍 {location}")
+    print(f"  Joined: {created}")
+    print(
+        f"  {_compact_num(followers)} followers · "
+        f"{_compact_num(following)} following · "
+        f"{_compact_num(tweets_count)} tweets"
+    )
+
+
+def cmd_tweets(args):
+    """View a user's tweets."""
+    user_id, user_result = _resolve_user_id(args.user)
+
+    variables = {
+        "userId": user_id,
+        "count": args.count,
+        "includePromotedContent": False,
+        "withQuickPromoteEligibilityTweetFields": True,
+        "withVoice": True,
+        "withV2Timeline": True,
+    }
+    if args.cursor:
+        variables["cursor"] = args.cursor
+
+    op = "UserTweetsAndReplies" if args.replies else "UserTweets"
+    data = graphql_get(Q[op], op, variables)
+
+    instructions = (
+        data.get("data", {})
+        .get("user", {}).get("result", {})
+        .get("timeline", {}).get("timeline", {})
+        .get("instructions", [])
+    )
+
+    entries = []
+    for inst in instructions:
+        if inst.get("type") == "TimelineAddEntries":
+            entries = inst.get("entries", [])
+            break
+
+    tweets, cursors = parse_timeline_entries(entries)
+
+    if args.json:
+        print(format_json(tweets))
+    else:
+        if not tweets:
+            print(f"No tweets found for @{args.user.lstrip('@')}")
+        else:
+            print(format_timeline(tweets, cursors))
+
+
+def cmd_thread(args):
+    """View a full thread/conversation around a tweet."""
+    tweet_id = _require_tweet_ref(args.tweet)
+
+    variables = {
+        "focalTweetId": tweet_id,
+        "with_rux_injections": False,
+        "includePromotedContent": False,
+        "withCommunity": True,
+        "withQuickPromoteEligibilityTweetFields": True,
+        "withBirdwatchNotes": True,
+        "withVoice": True,
+        "withV2Timeline": True,
+    }
+
+    data = graphql_get(Q["TweetDetail"], "TweetDetail", variables)
+
+    instructions = (
+        data.get("data", {})
+        .get("threaded_conversation_with_injections_v2", {})
+        .get("instructions", [])
+    )
+
+    entries = []
+    for inst in instructions:
+        if inst.get("type") == "TimelineAddEntries":
+            entries = inst.get("entries", [])
+            break
+
+    tweets, cursors = parse_timeline_entries(entries)
+
+    if args.json:
+        print(format_json(tweets))
+    else:
+        if not tweets:
+            print("Thread not found or could not be parsed.")
+        else:
+            print(format_timeline(tweets, cursors))
+
+
+def cmd_notifications(args):
+    """View recent notifications."""
+    variables = {
+        "timeline_type": "All",
+        "count": args.count,
+    }
+    if args.cursor:
+        variables["cursor"] = args.cursor
+
+    data = graphql_get(
+        Q["NotificationsTimeline"], "NotificationsTimeline", variables,
+    )
+
+    instructions = (
+        data.get("data", {})
+        .get("viewer_v2", {}).get("user_results", {}).get("result", {})
+        .get("notification_timeline", {}).get("timeline", {})
+        .get("instructions", [])
+    )
+
+    entries = []
+    for inst in instructions:
+        if inst.get("type") == "TimelineAddEntries":
+            entries = inst.get("entries", [])
+            break
+
+    tweets, cursors = parse_timeline_entries(entries)
+
+    if args.json:
+        print(format_json(tweets))
+    else:
+        if not tweets:
+            print("No notifications found.")
+        else:
+            print(format_timeline(tweets, cursors))
+
+
+def cmd_bookmarks(args):
+    """List bookmarked tweets."""
+    variables = {
+        "count": args.count,
+        "includePromotedContent": False,
+    }
+    if args.cursor:
+        variables["cursor"] = args.cursor
+
+    data = graphql_get(Q["Bookmarks"], "Bookmarks", variables)
+
+    instructions = (
+        data.get("data", {})
+        .get("bookmark_timeline_v2", {}).get("timeline", {})
+        .get("instructions", [])
+    )
+
+    entries = []
+    for inst in instructions:
+        if inst.get("type") == "TimelineAddEntries":
+            entries = inst.get("entries", [])
+            break
+
+    tweets, cursors = parse_timeline_entries(entries)
+
+    if args.json:
+        print(format_json(tweets))
+    else:
+        if not tweets:
+            print("No bookmarks found.")
+        else:
+            print(format_timeline(tweets, cursors))
+
+
+DM_PARAMS = {
+    "nsfw_filtering_enabled": "false",
+    "filter_low_quality": "false",
+    "include_quality": "all",
+    "include_profile_interstitial_type": "1",
+    "include_blocking": "1",
+    "include_blocked_by": "1",
+    "include_followed_by": "1",
+    "include_want_retweets": "1",
+    "include_mute_edge": "1",
+    "include_can_dm": "1",
+    "include_ext_is_blue_verified": "1",
+    "include_ext_verified_type": "1",
+    "include_ext_profile_image_shape": "1",
+}
+
+
+def _format_dm_time(time_ms):
+    """Convert DM timestamp (ms) to readable date."""
+    try:
+        from datetime import datetime, timezone
+        dt = datetime.fromtimestamp(int(time_ms) / 1000, tz=timezone.utc)
+        return dt.strftime("%Y-%m-%d %H:%M")
+    except (ValueError, TypeError, OSError):
+        return str(time_ms)
+
+
+def cmd_dms(args):
+    """List DM conversations."""
+    data = rest_get("/1.1/dm/inbox_initial_state.json", DM_PARAMS)
+    inbox = data.get("inbox_initial_state", {})
+    users = inbox.get("users", {})
+    convos = inbox.get("conversations", {})
+    entries = inbox.get("entries", [])
+
+    # Build user map
+    user_map = {}
+    for uid, u in users.items():
+        user_map[uid] = {
+            "name": u.get("name", uid),
+            "handle": u.get("screen_name", uid),
+        }
+
+    # Build last message per conversation
+    last_msg = {}
+    for entry in entries:
+        msg = entry.get("message", {})
+        conv_id = msg.get("conversation_id", "")
+        md = msg.get("message_data", {})
+        time_ms = msg.get("time", "0")
+        if conv_id not in last_msg or int(time_ms) > int(last_msg[conv_id]["time"]):
+            last_msg[conv_id] = {
+                "sender": md.get("sender_id", ""),
+                "text": md.get("text", ""),
+                "time": time_ms,
+            }
+
+    results = []
+    for conv_id, conv in convos.items():
+        participants = conv.get("participants", [])
+        others = []
+        for p in participants:
+            uid = p["user_id"]
+            if uid in user_map:
+                others.append(user_map[uid])
+        lm = last_msg.get(conv_id, {})
+        results.append({
+            "conversation_id": conv_id,
+            "participants": others,
+            "last_message": lm.get("text", ""),
+            "last_sender": user_map.get(lm.get("sender", ""), {}).get("handle", "?"),
+            "last_time": _format_dm_time(lm.get("time", "")),
+            "type": conv.get("type", ""),
+        })
+
+    if args.json:
+        print(format_json(results))
+    else:
+        if not results:
+            print("No conversations found.")
+        else:
+            for r in results:
+                names = " & ".join(
+                    f"@{p['handle']} ({p['name']})" for p in r["participants"]
+                )
+                print(f"💬 {names}")
+                print(f"   ID: {r['conversation_id']}")
+                if r["last_message"]:
+                    preview = r["last_message"][:100]
+                    if len(r["last_message"]) > 100:
+                        preview += "..."
+                    print(f"   [{r['last_time']}] @{r['last_sender']}: {preview}")
+                print()
+
+
+def cmd_dm(args):
+    """Read or send a DM in a conversation."""
+    # If --send is provided, send a message
+    if args.send:
+        _dm_send(args)
+        return
+
+    # Otherwise, read the conversation
+    conv_id = args.conversation
+
+    # If a @username is given instead of a conversation ID, resolve it
+    if not conv_id.replace("-", "").isdigit():
+        user_id, _ = _resolve_user_id(conv_id)
+        # Get own user ID from the inbox
+        data = rest_get("/1.1/dm/inbox_initial_state.json", DM_PARAMS)
+        inbox = data.get("inbox_initial_state", {})
+        convos = inbox.get("conversations", {})
+        # Find conversation with this user
+        found = False
+        for cid, conv in convos.items():
+            pids = [p["user_id"] for p in conv.get("participants", [])]
+            if user_id in pids:
+                conv_id = cid
+                found = True
+                break
+        if not found:
+            print(f"No conversation found with @{args.conversation.lstrip('@')}",
+                  file=sys.stderr)
+            sys.exit(1)
+
+    data = rest_get(f"/1.1/dm/conversation/{conv_id}.json", DM_PARAMS)
+    conv = data.get("conversation_timeline", {})
+    entries = conv.get("entries", [])
+    users = conv.get("users", {})
+
+    user_map = {}
+    for uid, u in users.items():
+        user_map[uid] = u.get("screen_name", uid)
+
+    messages = []
+    for entry in entries:
+        msg = entry.get("message", {})
+        md = msg.get("message_data", {})
+        if not md:
+            continue
+        sender_id = md.get("sender_id", "")
+        messages.append({
+            "sender": user_map.get(sender_id, sender_id),
+            "text": md.get("text", ""),
+            "time": _format_dm_time(msg.get("time", "")),
+            "id": entry.get("message", {}).get("id", ""),
+        })
+
+    if args.json:
+        print(format_json(messages))
+    else:
+        if not messages:
+            print("No messages in this conversation.")
+        else:
+            for m in messages:
+                print(f"[{m['time']}] @{m['sender']}: {m['text']}")
+
+
+def _dm_send(args):
+    """Send a DM."""
+    conv_id = args.conversation
+    text = " ".join(args.send)
+
+    # If a @username is given, resolve to conversation ID
+    if not conv_id.replace("-", "").isdigit():
+        user_id, _ = _resolve_user_id(conv_id)
+        # Try to find existing conversation
+        data = rest_get("/1.1/dm/inbox_initial_state.json", DM_PARAMS)
+        inbox = data.get("inbox_initial_state", {})
+        convos = inbox.get("conversations", {})
+        found = False
+        for cid, conv in convos.items():
+            pids = [p["user_id"] for p in conv.get("participants", [])]
+            if user_id in pids:
+                conv_id = cid
+                found = True
+                break
+        if not found:
+            # New conversation — just use the recipient user ID
+            conv_id = None
+
+    payload = {
+        "conversation_id": conv_id,
+        "text": text,
+        "cards_platform": "Web-12",
+        "include_cards": 1,
+        "include_quote_count": True,
+        "dm_users": False,
+    }
+    if conv_id is None:
+        # New conversation to a user
+        payload.pop("conversation_id")
+        payload["recipient_ids"] = False
+        # Actually for new DMs we need recipient_ids
+        payload = {
+            "recipient_ids": [user_id],
+            "text": text,
+            "cards_platform": "Web-12",
+            "include_cards": 1,
+        }
+
+    result = rest_post("/1.1/dm/new2.json", payload)
+
+    if args.json:
+        print(format_json(result))
+    else:
+        print(f"DM sent to conversation {conv_id or 'new'}")
+
+
+def cmd_trending(args):
+    """View trending topics."""
+    # Step 1: fetch ExplorePage to get the trending timeline ID
+    data = graphql_get(
+        Q["ExplorePage"], "ExplorePage",
+        {"count": 20, "includePromotedContent": False},
+    )
+
+    body = data.get("data", {}).get("explore_page", {}).get("body", {})
+    timelines = body.get("timelines", [])
+
+    trending_id = None
+    for t in timelines:
+        if t.get("id") == "trending":
+            trending_id = t.get("timeline", {}).get("id")
+            break
+
+    if not trending_id:
+        print("Could not find trending timeline.", file=sys.stderr)
+        sys.exit(1)
+
+    # Step 2: fetch the trending timeline
+    data = graphql_get(
+        Q["GenericTimelineById"], "GenericTimelineById",
+        {
+            "timelineId": trending_id,
+            "count": args.count,
+            "withQuickPromoteEligibilityTweetFields": True,
+        },
+    )
+
+    instructions = (
+        data.get("data", {})
+        .get("timeline", {}).get("timeline", {})
+        .get("instructions", [])
+    )
+
+    entries = []
+    for inst in instructions:
+        if inst.get("type") == "TimelineAddEntries":
+            entries = inst.get("entries", [])
+            break
+
+    items, cursors = parse_timeline_entries(entries)
+
+    if args.json:
+        print(format_json(items))
+    else:
+        if not items:
+            print("No trending topics found.")
+        else:
+            print(format_timeline(items, cursors))
+
+
+def cmd_like(args):
+    """Like a tweet."""
+    tweet_id = _require_tweet_ref(args.tweet)
+    graphql_post(Q["FavoriteTweet"], "FavoriteTweet", {"tweet_id": tweet_id})
+    if args.json:
+        print(format_json({"liked": tweet_id}))
+    else:
+        print(f"Liked tweet {tweet_id}")
+
+
+def cmd_unlike(args):
+    """Unlike a tweet."""
+    tweet_id = _require_tweet_ref(args.tweet)
+    graphql_post(Q["UnfavoriteTweet"], "UnfavoriteTweet", {"tweet_id": tweet_id})
+    if args.json:
+        print(format_json({"unliked": tweet_id}))
+    else:
+        print(f"Unliked tweet {tweet_id}")
+
+
+def cmd_rt(args):
+    """Retweet a tweet."""
+    tweet_id = _require_tweet_ref(args.tweet)
+    graphql_post(
+        Q["CreateRetweet"], "CreateRetweet",
+        {"tweet_id": tweet_id, "dark_request": False},
+    )
+    if args.json:
+        print(format_json({"retweeted": tweet_id}))
+    else:
+        print(f"Retweeted {tweet_id}")
+
+
+def cmd_unrt(args):
+    """Undo a retweet."""
+    tweet_id = _require_tweet_ref(args.tweet)
+    graphql_post(
+        Q["DeleteRetweet"], "DeleteRetweet",
+        {"source_tweet_id": tweet_id, "dark_request": False},
+    )
+    if args.json:
+        print(format_json({"unretweeted": tweet_id}))
+    else:
+        print(f"Unretweeted {tweet_id}")
+
+
+def cmd_delete(args):
+    """Delete one of your own tweets."""
+    tweet_id = _require_tweet_ref(args.tweet)
+    graphql_post(
+        Q["DeleteTweet"], "DeleteTweet",
+        {"tweet_id": tweet_id, "dark_request": False},
+    )
+    if args.json:
+        print(format_json({"deleted": tweet_id}))
+    else:
+        print(f"Deleted tweet {tweet_id}")
+
+
+def cmd_bookmark(args):
+    """Bookmark a tweet."""
+    tweet_id = _require_tweet_ref(args.tweet)
+    graphql_post(Q["CreateBookmark"], "CreateBookmark", {"tweet_id": tweet_id})
+    if args.json:
+        print(format_json({"bookmarked": tweet_id}))
+    else:
+        print(f"Bookmarked tweet {tweet_id}")
+
+
+def cmd_unbookmark(args):
+    """Remove a bookmark from a tweet."""
+    tweet_id = _require_tweet_ref(args.tweet)
+    graphql_post(Q["DeleteBookmark"], "DeleteBookmark", {"tweet_id": tweet_id})
+    if args.json:
+        print(format_json({"unbookmarked": tweet_id}))
+    else:
+        print(f"Unbookmarked tweet {tweet_id}")
+
+
+def _user_action(args, endpoint, action_name, past_tense):
+    """Perform a user-targeted REST action (follow, mute, block, etc.)."""
+    username = args.user.lstrip("@")
+    user_id, _ = _resolve_user_id(username)
+    rest_post(endpoint, {"user_id": user_id}, form=True)
+    if args.json:
+        print(format_json({action_name: username, "user_id": user_id}))
+    else:
+        print(f"{past_tense} @{username}")
+
+
+def cmd_follow(args):
+    """Follow a user."""
+    _user_action(args, "/1.1/friendships/create.json", "followed", "Followed")
+
+
+def cmd_unfollow(args):
+    """Unfollow a user."""
+    _user_action(args, "/1.1/friendships/destroy.json", "unfollowed", "Unfollowed")
+
+
+def cmd_mute(args):
+    """Mute a user."""
+    _user_action(args, "/1.1/mutes/users/create.json", "muted", "Muted")
+
+
+def cmd_unmute(args):
+    """Unmute a user."""
+    _user_action(args, "/1.1/mutes/users/destroy.json", "unmuted", "Unmuted")
+
+
+def cmd_block(args):
+    """Block a user."""
+    _user_action(args, "/1.1/blocks/create.json", "blocked", "Blocked")
+
+
+def cmd_unblock(args):
+    """Unblock a user."""
+    _user_action(args, "/1.1/blocks/destroy.json", "unblocked", "Unblocked")
+
+
+def cmd_help(args):
+    """Show detailed help for the twitter tool or a specific command."""
+    if not args.topic:
+        # General help
+        print(HELP_TEXT)
+        return
+
+    topic = args.topic[0]
+
+    if topic in COMMAND_HELP:
+        info = COMMAND_HELP[topic]
+        print(f"\ntwitter {topic}" + (f" (alias: {info['alias']})" if info.get("alias") else ""))
+        print(f"  {info['summary']}\n")
+        print(f"  Usage: {info['usage']}\n")
+        if info.get("flags"):
+            print("  Flags:")
+            for flag, desc in info["flags"].items():
+                print(f"    {flag:20s} {desc}")
+            print()
+        if info.get("examples"):
+            print("  Examples:")
+            for ex in info["examples"]:
+                print(f"    {ex}")
+            print()
+    else:
+        # Check if it's an alias
+        for cmd, info in COMMAND_HELP.items():
+            if info.get("alias") == topic:
+                args.topic = [cmd]
+                cmd_help(args)
+                return
+        print(f"Unknown command: {topic}")
+        print(f"Run 'twitter help' for available commands.")
+
+
+# ─── Help Content ──────────────────────────────────────────
+
+HELP_TEXT = """\
+twitter — Terminal client for X/Twitter
+
+Works by mirroring the requests that x.com's web client makes, using auth
+tokens from a logged-in qutebrowser-mnemo session. Indistinguishable from
+normal browser usage. No API keys, no paid tiers.
+
+Commands:
+  Reading:
+    timeline, tl         Home feed (algorithmic or --latest chronological)
+    tweet <id_or_url>    View a single tweet by ID or URL
+    search, s <query>    Search tweets (--latest for chronological)
+    profile, p <@user>   View a user's profile (bio, stats, verified)
+    tweets <@user>       View a user's tweets (--replies to include replies)
+    thread <id_or_url>   View a full thread/conversation around a tweet
+    notifications, notif Recent notifications (mentions, likes, RTs, follows)
+    bookmarks, bms       List your bookmarked tweets
+    trending             Trending topics worldwide
+
+  Direct Messages:
+    dms                  List all DM conversations with last message
+    dm <@user_or_id>     Read a DM conversation
+    dm <@user> -s <text> Send a DM
+
+  Posting:
+    post <text>          Post a tweet
+    reply <tweet> <text> Reply to a tweet
+    post -r <tweet> <text>   Reply to a tweet (alternative)
+    post -q <tweet> <text>   Quote tweet
+    delete <id_or_url>   Delete one of your own tweets
+
+  Engagement:
+    like / unlike        Like or unlike a tweet
+    rt / unrt            Retweet or undo a retweet
+    bookmark, bm         Bookmark a tweet
+    unbookmark, ubm      Remove a bookmark
+    follow / unfollow    Follow or unfollow a user
+    mute / unmute        Mute or unmute a user
+    block / unblock      Block or unblock a user
+
+  Other:
+    help [command]       Show this help, or help for a specific command
+
+Global flags:
+  --json                 Output as JSON (works on all commands)
+
+Tweet references:
+  Anywhere a tweet is needed, pass a full URL or a bare numeric ID:
+    https://x.com/user/status/1234567890
+    1234567890
+
+User references:
+  Anywhere a user is needed, pass with or without @:
+    @im_aurelio
+    im_aurelio
+
+Run 'twitter help <command>' for detailed help on any command.\
+"""
+
+COMMAND_HELP = {
+    "timeline": {
+        "alias": "tl",
+        "summary": "Display the home timeline.",
+        "usage": "twitter timeline [flags]",
+        "flags": {
+            "-n, --count N":   "Number of tweets to fetch (default: 20)",
+            "-l, --latest":    "Chronological timeline instead of algorithmic",
+            "-c, --cursor C":  "Pagination cursor (shown at bottom of output)",
+        },
+        "examples": [
+            "twitter tl",
+            "twitter tl -n 5 --latest",
+            "twitter tl -c 'DAABCgAB...'",
+            "twitter --json tl -n 10",
+        ],
+    },
+    "tweet": {
+        "summary": "View a single tweet.",
+        "usage": "twitter tweet <id_or_url>",
+        "examples": [
+            "twitter tweet 1234567890",
+            "twitter tweet https://x.com/user/status/1234567890",
+            "twitter --json tweet 1234567890",
+        ],
+    },
+    "search": {
+        "alias": "s",
+        "summary": "Search tweets by keyword, hashtag, or advanced query.",
+        "usage": "twitter search <query> [flags]",
+        "flags": {
+            "-n, --count N":   "Number of results (default: 20)",
+            "-l, --latest":    "Sort by latest instead of top/relevance",
+            "-c, --cursor C":  "Pagination cursor",
+        },
+        "examples": [
+            "twitter search 'Claude AI'",
+            "twitter s 'from:elonmusk AI' --latest -n 5",
+            "twitter search '#archlinux' -l",
+        ],
+    },
+    "profile": {
+        "alias": "p",
+        "summary": "View a user's profile — bio, stats, join date.",
+        "usage": "twitter profile <@user>",
+        "examples": [
+            "twitter profile @AnthropicAI",
+            "twitter p elonmusk",
+            "twitter --json profile @im_aurelio",
+        ],
+    },
+    "post": {
+        "summary": "Post a tweet. Can also reply to or quote another tweet.",
+        "usage": "twitter post <text> [flags]",
+        "flags": {
+            "-r, --reply ID":  "Tweet ID/URL to reply to",
+            "-q, --quote ID":  "Tweet ID/URL to quote",
+        },
+        "examples": [
+            "twitter post 'Hello from the terminal'",
+            "twitter post 'Great point' --reply 1234567890",
+            "twitter post 'This is wild' -q https://x.com/user/status/123",
+        ],
+    },
+    "reply": {
+        "summary": "Reply to a tweet. Shorthand for 'post --reply'.",
+        "usage": "twitter reply <tweet_id_or_url> <text>",
+        "examples": [
+            "twitter reply 1234567890 Great point!",
+            "twitter reply https://x.com/user/status/123 This is wild",
+        ],
+    },
+    "delete": {
+        "summary": "Delete one of your own tweets.",
+        "usage": "twitter delete <id_or_url>",
+        "examples": [
+            "twitter delete 1234567890",
+        ],
+    },
+    "like": {
+        "summary": "Like a tweet.",
+        "usage": "twitter like <id_or_url>",
+        "examples": [
+            "twitter like 1234567890",
+            "twitter like https://x.com/user/status/123",
+        ],
+    },
+    "unlike": {
+        "summary": "Remove a like from a tweet.",
+        "usage": "twitter unlike <id_or_url>",
+        "examples": ["twitter unlike 1234567890"],
+    },
+    "rt": {
+        "summary": "Retweet a tweet.",
+        "usage": "twitter rt <id_or_url>",
+        "examples": ["twitter rt 1234567890"],
+    },
+    "unrt": {
+        "summary": "Undo a retweet.",
+        "usage": "twitter unrt <id_or_url>",
+        "examples": ["twitter unrt 1234567890"],
+    },
+    "bookmark": {
+        "alias": "bm",
+        "summary": "Bookmark a tweet for later.",
+        "usage": "twitter bookmark <id_or_url>",
+        "examples": [
+            "twitter bookmark 1234567890",
+            "twitter bm https://x.com/user/status/123",
+        ],
+    },
+    "unbookmark": {
+        "alias": "ubm",
+        "summary": "Remove a bookmark from a tweet.",
+        "usage": "twitter unbookmark <id_or_url>",
+        "examples": ["twitter ubm 1234567890"],
+    },
+    "tweets": {
+        "summary": "View a user's tweets.",
+        "usage": "twitter tweets <@user> [flags]",
+        "flags": {
+            "-n, --count N":   "Number of tweets (default: 20)",
+            "-c, --cursor C":  "Pagination cursor",
+            "--replies":       "Include replies (not just original tweets)",
+        },
+        "examples": [
+            "twitter tweets @elonmusk",
+            "twitter tweets im_aurelio -n 5",
+            "twitter tweets @AnthropicAI --replies",
+        ],
+    },
+    "thread": {
+        "summary": "View a full thread/conversation around a tweet.",
+        "usage": "twitter thread <id_or_url>",
+        "examples": [
+            "twitter thread 1234567890",
+            "twitter thread https://x.com/user/status/123",
+        ],
+    },
+    "notifications": {
+        "alias": "notif",
+        "summary": "View recent notifications (mentions, likes, RTs, follows).",
+        "usage": "twitter notifications [flags]",
+        "flags": {
+            "-n, --count N":   "Number of notifications (default: 20)",
+            "-c, --cursor C":  "Pagination cursor",
+        },
+        "examples": [
+            "twitter notifications",
+            "twitter notif -n 10",
+        ],
+    },
+    "bookmarks": {
+        "alias": "bms",
+        "summary": "List your bookmarked tweets.",
+        "usage": "twitter bookmarks [flags]",
+        "flags": {
+            "-n, --count N":   "Number of bookmarks (default: 20)",
+            "-c, --cursor C":  "Pagination cursor",
+        },
+        "examples": [
+            "twitter bookmarks",
+            "twitter bms -n 5",
+        ],
+    },
+    "trending": {
+        "summary": "View trending topics.",
+        "usage": "twitter trending [flags]",
+        "flags": {
+            "-n, --count N":   "Number of trends (default: 20)",
+        },
+        "examples": [
+            "twitter trending",
+            "twitter trending -n 10",
+        ],
+    },
+    "dms": {
+        "summary": "List your DM conversations with last message preview.",
+        "usage": "twitter dms",
+        "examples": [
+            "twitter dms",
+            "twitter --json dms",
+        ],
+    },
+    "dm": {
+        "summary": "Read a DM conversation or send a message.",
+        "usage": "twitter dm <conversation_id_or_@user> [flags]",
+        "flags": {
+            "-s, --send TEXT": "Send a message to this conversation",
+        },
+        "examples": [
+            "twitter dm @someuser",
+            "twitter dm 123456-789012",
+            "twitter dm @someuser -s Hello, how are you?",
+        ],
+    },
+    "follow": {
+        "summary": "Follow a user.",
+        "usage": "twitter follow <@user>",
+        "examples": ["twitter follow @AnthropicAI"],
+    },
+    "unfollow": {
+        "summary": "Unfollow a user.",
+        "usage": "twitter unfollow <@user>",
+        "examples": ["twitter unfollow @AnthropicAI"],
+    },
+    "mute": {
+        "summary": "Mute a user (hide their tweets from your timeline).",
+        "usage": "twitter mute <@user>",
+        "examples": ["twitter mute @spammer"],
+    },
+    "unmute": {
+        "summary": "Unmute a user.",
+        "usage": "twitter unmute <@user>",
+        "examples": ["twitter unmute @spammer"],
+    },
+    "block": {
+        "summary": "Block a user.",
+        "usage": "twitter block <@user>",
+        "examples": ["twitter block @troll"],
+    },
+    "unblock": {
+        "summary": "Unblock a user.",
+        "usage": "twitter unblock <@user>",
+        "examples": ["twitter unblock @troll"],
+    },
+}
+
+
+# ─── CLI Setup ─────────────────────────────────────────────
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="twitter",
+        description="Terminal client for X/Twitter.",
+        add_help=True,
+    )
+    parser.add_argument(
+        "--json", action="store_true",
+        help="Output as JSON instead of human-readable text",
+    )
+    subparsers = parser.add_subparsers(dest="command")
+
+    # help
+    p = subparsers.add_parser("help", help="Show help for a command")
+    p.add_argument("topic", nargs="*", help="Command to get help for")
+
+    # timeline
+    p = subparsers.add_parser("timeline", aliases=["tl"], help="Home timeline")
+    p.add_argument("-n", "--count", type=int, default=20, help="Number of tweets")
+    p.add_argument("-c", "--cursor", type=str, help="Pagination cursor")
+    p.add_argument("-l", "--latest", action="store_true", help="Latest/chronological")
+
+    # post
+    p = subparsers.add_parser("post", help="Post a tweet")
+    p.add_argument("text", nargs="+", help="Tweet text")
+    p.add_argument("-r", "--reply", type=str, help="Tweet ID/URL to reply to")
+    p.add_argument("-q", "--quote", type=str, help="Tweet ID/URL to quote")
+
+    # reply (alias for post --reply)
+    p = subparsers.add_parser("reply", help="Reply to a tweet")
+    p.add_argument("tweet", help="Tweet ID or URL to reply to")
+    p.add_argument("text", nargs="+", help="Reply text")
+
+    # tweet (view)
+    p = subparsers.add_parser("tweet", help="View a single tweet")
+    p.add_argument("tweet", help="Tweet ID or URL")
+
+    # search
+    p = subparsers.add_parser("search", aliases=["s"], help="Search tweets")
+    p.add_argument("query", nargs="+", help="Search query")
+    p.add_argument("-n", "--count", type=int, default=20, help="Number of results")
+    p.add_argument("-c", "--cursor", type=str, help="Pagination cursor")
+    p.add_argument("-l", "--latest", action="store_true", help="Latest results")
+
+    # profile
+    p = subparsers.add_parser("profile", aliases=["p"], help="View user profile")
+    p.add_argument("user", help="Username (with or without @)")
+
+    # like / unlike
+    p = subparsers.add_parser("like", help="Like a tweet")
+    p.add_argument("tweet", help="Tweet ID or URL")
+    p = subparsers.add_parser("unlike", help="Unlike a tweet")
+    p.add_argument("tweet", help="Tweet ID or URL")
+
+    # rt / unrt
+    p = subparsers.add_parser("rt", help="Retweet")
+    p.add_argument("tweet", help="Tweet ID or URL")
+    p = subparsers.add_parser("unrt", help="Undo retweet")
+    p.add_argument("tweet", help="Tweet ID or URL")
+
+    # delete
+    p = subparsers.add_parser("delete", help="Delete a tweet")
+    p.add_argument("tweet", help="Tweet ID or URL")
+
+    # bookmark / unbookmark
+    p = subparsers.add_parser("bookmark", aliases=["bm"], help="Bookmark a tweet")
+    p.add_argument("tweet", help="Tweet ID or URL")
+    p = subparsers.add_parser("unbookmark", aliases=["ubm"], help="Remove bookmark")
+    p.add_argument("tweet", help="Tweet ID or URL")
+
+    # tweets (user's tweets)
+    p = subparsers.add_parser("tweets", help="View a user's tweets")
+    p.add_argument("user", help="Username (with or without @)")
+    p.add_argument("-n", "--count", type=int, default=20, help="Number of tweets")
+    p.add_argument("-c", "--cursor", type=str, help="Pagination cursor")
+    p.add_argument("--replies", action="store_true", help="Include replies")
+
+    # thread
+    p = subparsers.add_parser("thread", help="View a full thread/conversation")
+    p.add_argument("tweet", help="Tweet ID or URL (any tweet in the thread)")
+
+    # notifications
+    p = subparsers.add_parser("notifications", aliases=["notif"], help="Recent notifications")
+    p.add_argument("-n", "--count", type=int, default=20, help="Number of notifications")
+    p.add_argument("-c", "--cursor", type=str, help="Pagination cursor")
+
+    # bookmarks (list)
+    p = subparsers.add_parser("bookmarks", aliases=["bms"], help="List bookmarked tweets")
+    p.add_argument("-n", "--count", type=int, default=20, help="Number of bookmarks")
+    p.add_argument("-c", "--cursor", type=str, help="Pagination cursor")
+
+    # trending
+    p = subparsers.add_parser("trending", help="Trending topics")
+    p.add_argument("-n", "--count", type=int, default=20, help="Number of trends")
+
+    # dms (list conversations)
+    p = subparsers.add_parser("dms", help="List DM conversations")
+
+    # dm (read/send conversation)
+    p = subparsers.add_parser("dm", help="Read or send a DM conversation")
+    p.add_argument("conversation", help="Conversation ID or @username")
+    p.add_argument("-s", "--send", nargs="+", help="Send a message")
+
+    # follow / unfollow
+    p = subparsers.add_parser("follow", help="Follow a user")
+    p.add_argument("user", help="Username (with or without @)")
+    p = subparsers.add_parser("unfollow", help="Unfollow a user")
+    p.add_argument("user", help="Username (with or without @)")
+
+    # mute / unmute
+    p = subparsers.add_parser("mute", help="Mute a user")
+    p.add_argument("user", help="Username (with or without @)")
+    p = subparsers.add_parser("unmute", help="Unmute a user")
+    p.add_argument("user", help="Username (with or without @)")
+
+    # block / unblock
+    p = subparsers.add_parser("block", help="Block a user")
+    p.add_argument("user", help="Username (with or without @)")
+    p = subparsers.add_parser("unblock", help="Unblock a user")
+    p.add_argument("user", help="Username (with or without @)")
+
+    args = parser.parse_args()
+
+    if not args.command:
+        cmd_help(argparse.Namespace(topic=[]))
+        sys.exit(0)
+
+    dispatch = {
+        "help": cmd_help,
+        "timeline": cmd_timeline, "tl": cmd_timeline,
+        "post": cmd_post,
+        "reply": cmd_reply,
+        "tweet": cmd_tweet,
+        "search": cmd_search, "s": cmd_search,
+        "profile": cmd_profile, "p": cmd_profile,
+        "tweets": cmd_tweets,
+        "thread": cmd_thread,
+        "notifications": cmd_notifications, "notif": cmd_notifications,
+        "bookmarks": cmd_bookmarks, "bms": cmd_bookmarks,
+        "trending": cmd_trending,
+        "dms": cmd_dms,
+        "dm": cmd_dm,
+        "follow": cmd_follow, "unfollow": cmd_unfollow,
+        "mute": cmd_mute, "unmute": cmd_unmute,
+        "block": cmd_block, "unblock": cmd_unblock,
+        "like": cmd_like, "unlike": cmd_unlike,
+        "rt": cmd_rt, "unrt": cmd_unrt,
+        "delete": cmd_delete,
+        "bookmark": cmd_bookmark, "bm": cmd_bookmark,
+        "unbookmark": cmd_unbookmark, "ubm": cmd_unbookmark,
+    }
+
+    try:
+        dispatch[args.command](args)
+    except RuntimeError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(130)
+
+
+if __name__ == "__main__":
+    main()

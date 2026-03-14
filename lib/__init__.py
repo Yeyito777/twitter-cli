@@ -1,0 +1,1 @@
+"""twitter lib — Auth, API, parsing, and formatting for the Twitter terminal client."""
