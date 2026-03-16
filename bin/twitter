@@ -29,7 +29,7 @@ import argparse
 import json
 
 from lib.api import graphql_get, graphql_post, rest_get, rest_post
-from lib.auth import setup_interactive
+from lib.auth import setup_interactive, delete_tokens
 from lib.parse import parse_timeline_entries, parse_tweet
 from lib.format import format_timeline, format_tweet, format_json
 
@@ -896,6 +896,14 @@ def cmd_setup(args):
         sys.exit(1)
 
 
+def cmd_logout(args):
+    """Remove stored credentials."""
+    if delete_tokens():
+        print("Logged out — credentials deleted.")
+    else:
+        print("Already logged out (no credentials found).")
+
+
 def cmd_help(args):
     """Show detailed help for the twitter tool or a specific command."""
     if not args.topic:
@@ -977,7 +985,8 @@ Commands:
     block / unblock      Block or unblock a user
 
   Other:
-    setup                Configure or update your auth credentials
+    setup, auth, login   Configure or update your auth credentials
+    logout               Remove stored credentials
     help [command]       Show this help, or help for a specific command
 
 Global flags:
@@ -998,10 +1007,20 @@ Run 'twitter help <command>' for detailed help on any command.\
 
 COMMAND_HELP = {
     "setup": {
+        "alias": "auth, login",
         "summary": "Configure your auth credentials (cookies from x.com).",
         "usage": "twitter setup",
         "examples": [
             "twitter setup",
+            "twitter auth",
+            "twitter login",
+        ],
+    },
+    "logout": {
+        "summary": "Remove stored credentials.",
+        "usage": "twitter logout",
+        "examples": [
+            "twitter logout",
         ],
     },
     "timeline": {
@@ -1247,8 +1266,11 @@ def main():
     )
     subparsers = parser.add_subparsers(dest="command")
 
-    # setup
-    p = subparsers.add_parser("setup", help="Configure auth credentials")
+    # setup / auth / login
+    p = subparsers.add_parser("setup", aliases=["auth", "login"], help="Configure auth credentials")
+
+    # logout
+    p = subparsers.add_parser("logout", help="Remove stored credentials")
 
     # help
     p = subparsers.add_parser("help", help="Show help for a command")
@@ -1366,7 +1388,8 @@ def main():
         sys.exit(0)
 
     dispatch = {
-        "setup": cmd_setup,
+        "setup": cmd_setup, "auth": cmd_setup, "login": cmd_setup,
+        "logout": cmd_logout,
         "help": cmd_help,
         "timeline": cmd_timeline, "tl": cmd_timeline,
         "post": cmd_post,

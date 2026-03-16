@@ -119,6 +119,18 @@ def setup_interactive():
     return True
 
 
+def delete_tokens():
+    """Delete credentials.json.
+
+    Returns True if the file was deleted, False if it didn't exist.
+    """
+    path = _credentials_file()
+    if not path.exists():
+        return False
+    path.unlink()
+    return True
+
+
 if __name__ == "__main__":
     try:
         t = get_tokens()
