@@ -1,66 +1,119 @@
-# twitter — Terminal Client for X/Twitter
+# twitter-cli
 
-A terminal tool that gives full access to Twitter/X by mirroring the requests
-that the web client makes. From Twitter's servers' perspective, this is
-indistinguishable from a normal browser session.
+A terminal client for X/Twitter that works by mirroring the requests the web
+client makes. From Twitter's servers' perspective, this is indistinguishable
+from a normal browser session.
 
 No API keys. No paid tiers. Just your existing browser session.
 
-## How It Works
+## How it works
 
 Twitter's web app (x.com) is a JavaScript client that talks to internal GraphQL
-endpoints. This tool:
+and REST endpoints. This tool makes the same HTTP requests, using session
+cookies you paste from your browser. That's it — no OAuth apps, no developer
+accounts, no API rate limit tiers.
 
-1. Extracts auth tokens from your logged-in qutebrowser-mnemo session
-2. Generates valid `x-client-transaction-id` headers (required by some endpoints)
-3. Makes the same HTTP requests the browser would make
-4. Parses the responses into clean, readable output
+## Quick start
 
-## Prerequisites
+### 1. Install
 
-- qutebrowser-mnemo must be running with an active Twitter login at x.com
-- Python 3.10+
-- `XClientTransaction` library (`pip install XClientTransaction`)
-- `beautifulsoup4` and `requests` (dependencies of XClientTransaction)
+```bash
+git clone https://github.com/Yeyito777/twitter-cli.git
+cd twitter-cli
 
-## Installation
+# Install the Python dependency
+pip install XClientTransaction
 
-Already installed — symlinked to `~/.local/bin/twitter`.
-
-To reinstall:
-```
-ln -sf ~/Workspace/twitter/bin/twitter ~/.local/bin/twitter
+# Symlink to your PATH
+ln -sf "$(pwd)/bin/twitter" ~/.local/bin/twitter
 ```
 
-## Usage
+### 2. Authenticate
+
+```bash
+twitter setup
+```
+
+This will ask you to paste two cookies from your browser:
+
+1. Open [x.com](https://x.com) and log in
+2. Open DevTools (`F12`) → **Application** tab → **Cookies** → `https://x.com`
+3. Copy the values for **`auth_token`** and **`ct0`**
+4. Paste them when prompted
+
+```
+$ twitter setup
+
+  twitter-cli setup
+  ─────────────────
+
+  This tool needs two cookies from a logged-in x.com session:
+  auth_token and ct0.
+
+  To get them:
+
+  1. Open https://x.com in your browser and log in
+  2. Open DevTools (F12) → Application tab → Cookies → https://x.com
+  3. Find and copy the values for 'auth_token' and 'ct0'
+
+  Paste auth_token: ****
+  Paste ct0: ****
+
+  ✓ Credentials saved to ~/.config/twitter-cli/auth.json
+  You're all set! Try 'twitter tl' to see your timeline.
+```
+
+Credentials are stored in `~/.config/twitter-cli/auth.json` with `600`
+permissions. These are session cookies — they expire when you log out or after
+extended inactivity. Just re-run `twitter setup` if that happens.
+
+### 3. Use it
+
+```bash
+twitter tl                # Home timeline
+twitter search "Claude"   # Search
+twitter profile @elonmusk # View a profile
+twitter post "Hello"      # Post a tweet
+```
+
+## Commands
 
 ### Reading
 
 ```bash
-# Home timeline (algorithmic)
-twitter timeline
-twitter tl
+# Home timeline
+twitter timeline                  # or: twitter tl
+twitter tl --latest               # Chronological instead of algorithmic
+twitter tl -n 5                   # Limit to 5 tweets
+twitter tl -c "DAABCgAB..."      # Paginate with cursor
 
-# Home timeline (latest / chronological)
-twitter tl --latest
-
-# Specific number of tweets
-twitter tl -n 5
-
-# Paginate with cursor (shown at bottom of output)
-twitter tl -c "DAABCgABGXlN..."
-
-# View a single tweet (by URL or ID)
-twitter tweet https://x.com/elonmusk/status/1234567890
+# Single tweet
+twitter tweet https://x.com/user/status/1234567890
 twitter tweet 1234567890
 
 # Search
-twitter search "Claude AI"
-twitter s "machine learning" --latest -n 10
+twitter search "query"
+twitter s "from:elonmusk AI" --latest -n 10
 
-# View a user's profile
-twitter profile @AnthropicAI
+# User profile
+twitter profile @user
 twitter p elonmusk
+
+# User's tweets
+twitter tweets @user
+twitter tweets @user --replies    # Include replies
+
+# Thread / conversation
+twitter thread 1234567890
+
+# Notifications
+twitter notifications             # or: twitter notif
+
+# Bookmarks
+twitter bookmarks                 # or: twitter bms
+
+# Trending
+twitter trending
 ```
 
 ### Posting
@@ -69,114 +122,92 @@ twitter p elonmusk
 # Post a tweet
 twitter post "Hello from the terminal"
 
-# Reply to a tweet
-twitter post "Great point" --reply https://x.com/user/status/123
-twitter post "Agreed" -r 123456789
+# Reply
+twitter reply 1234567890 "Great point"
+twitter post "Great point" --reply 1234567890
 
 # Quote tweet
-twitter post "This is interesting" --quote 123456789
+twitter post "Interesting" --quote 1234567890
+
+# Delete
+twitter delete 1234567890
 ```
 
 ### Engagement
 
 ```bash
-# Like / unlike
-twitter like 123456789
-twitter unlike https://x.com/user/status/123
+twitter like 1234567890
+twitter unlike 1234567890
+twitter rt 1234567890
+twitter unrt 1234567890
+twitter bookmark 1234567890
+twitter unbookmark 1234567890
+```
 
-# Retweet / undo
-twitter rt 123456789
-twitter unrt 123456789
+### Social
 
-# Bookmark / remove
-twitter bookmark 123456789
-twitter unbookmark 123456789
+```bash
+twitter follow @user
+twitter unfollow @user
+twitter mute @user
+twitter unmute @user
+twitter block @user
+twitter unblock @user
+```
 
-# Delete your own tweet
-twitter delete 123456789
+### Direct messages
+
+```bash
+twitter dms                           # List conversations
+twitter dm @user                      # Read conversation
+twitter dm @user --send "Hey there"   # Send a DM
 ```
 
 ### Flags
 
 ```bash
-# JSON output (on any command)
+# JSON output (works on any command)
 twitter --json tl -n 5
 twitter --json search "query"
-twitter --json tweet 123456789
 
 # Help
 twitter help
-twitter help post
 twitter help search
 ```
 
-## Tweet References
+## Tweet references
 
-Anywhere a tweet is expected, you can use:
+Anywhere a tweet is expected, you can pass:
 - A full URL: `https://x.com/user/status/1234567890`
 - A bare ID: `1234567890`
 
-## Architecture
+## Requirements
 
-```
-twitter/
-├── bin/twitter          # CLI entry point (argparse-based)
-├── lib/
-│   ├── auth.py          # Token extraction from qutebrowser cookie store
-│   ├── api.py           # HTTP requests + transaction ID generation
-│   ├── parse.py         # Response JSON → flat tweet dicts
-│   ├── format.py        # Tweet dicts → terminal-friendly text
-│   ├── endpoints.txt    # All 161 GraphQL query hashes
-│   └── api-notes.md     # Reverse engineering notes
-├── downloads/           # Media downloads
-└── todo.md              # Development roadmap
-```
+- Python 3.10+
+- [`XClientTransaction`](https://pypi.org/project/XClientTransaction/) (`pip install XClientTransaction`)
 
-### Auth Flow
+The `XClientTransaction` package pulls in `requests` and `beautifulsoup4` as
+transitive dependencies.
 
-```
-qutebrowser-mnemo cookie store (SQLite)
-    → auth.py extracts auth_token + ct0
-    → api.py builds headers identical to browser
-    → x-client-transaction-id generated via XClientTransaction lib
-    → requests hit x.com/i/api/graphql/... endpoints
-    → responses parsed by parse.py
-    → formatted by format.py
-```
+## How auth works
 
-### Key Files
+Twitter's web app uses a static bearer token (the same for every user) plus
+two session cookies (`auth_token` and `ct0`) for authentication. Some endpoints
+also require a signed `x-client-transaction-id` header, which this tool
+generates using the `XClientTransaction` library (it fetches x.com's homepage
+JS to compute valid tokens).
 
-- **auth.py** — Reads `auth_token` and `ct0` cookies from
-  `~/.runtime/qutebrowser-mnemo/data/webengine/Cookies` (Chromium SQLite format).
-  The bearer token is static (same for all Twitter web users).
+All of this is documented in `lib/api-notes.md`.
 
-- **api.py** — Makes authenticated GET/POST requests to Twitter's GraphQL API.
-  Generates `x-client-transaction-id` headers using the XClientTransaction library
-  (which fetches x.com's homepage and ondemand JS to compute valid signed tokens).
-  The generator is initialized once per process and cached.
+## Refreshing query hashes
 
-- **parse.py** — Navigates Twitter's deeply nested GraphQL response structures.
-  Handles `Tweet`, `TweetWithVisibilityResults`, retweets (nested original),
-  quote tweets (nested quoted), and timeline cursor entries.
-
-- **format.py** — Renders tweets with engagement stats (♥ 🔁 💬 👁),
-  media attachments, quote tweet boxes, reply context, and retweet attribution.
-
-- **endpoints.txt** — 161 GraphQL query hashes extracted from Twitter's
-  `client-web/main.*.js` bundle. These hashes change on Twitter deploys.
-
-## Refreshing Query Hashes
-
-If commands start returning 404 ("Query not found"), the query hashes have
-changed. To re-extract:
+Twitter's GraphQL endpoints use query hashes that change when Twitter deploys
+new code. If commands start returning 404 ("Query not found"), the hashes need
+to be re-extracted from Twitter's JavaScript bundle:
 
 ```bash
-# Find the current main bundle URL from a loaded Twitter page
-TAB=~/.runtime/qutebrowser-mnemo/runtime/tabs/<tab_id>
-cat $TAB/network.json | jq -r '.requests[].url' | grep "client-web/main"
-
-# Download and extract all hashes
-curl -s "<bundle_url>" | \
+# Download the main JS bundle from a loaded x.com page
+curl -s "https://abs.twimg.com/responsive-web/client-web/main.<hash>.js" | \
   grep -oP '"[a-zA-Z0-9_/-]{15,40}",operationName:"[A-Z][a-zA-Z]+"' | \
   sed 's/",operationName:"/\t/' | sed 's/"$//g' | sed 's/^"//' | \
   sort -t$'\t' -k2 > lib/endpoints.txt
@@ -184,12 +215,22 @@ curl -s "<bundle_url>" | \
 
 Then update the `Q` dict in `bin/twitter` with the new hashes.
 
+## Configuration
+
+| Item | Default | Override |
+|---|---|---|
+| Auth file | `~/.config/twitter-cli/auth.json` | `TWITTER_AUTH_FILE` env var |
+
 ## Troubleshooting
 
 | Problem | Fix |
 |---|---|
-| `Cookie database not found` | Start qutebrowser-mnemo and log into x.com |
-| `Missing Twitter cookies: auth_token, ct0` | Log into x.com in qutebrowser-mnemo |
+| `Not authenticated` | Run `twitter setup` |
+| `Auth file is missing: ...` | Run `twitter setup` again |
 | `HTTP 404: {"message":"Query not found"}` | Query hashes changed — re-extract (see above) |
-| `HTTP 403` | Session may have expired — re-login in qutebrowser-mnemo |
+| `HTTP 403` | Session expired — log into x.com in your browser, then `twitter setup` |
 | `HTTP 429` | Rate limited — wait a few minutes |
+
+## License
+
+[MIT](LICENSE)
