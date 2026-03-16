@@ -59,13 +59,14 @@ $ twitter setup
   Paste auth_token: ****
   Paste ct0: ****
 
-  ✓ Credentials saved to ~/.config/twitter-cli/auth.json
+  ✓ Credentials saved to ~/.config/twitter-cli/credentials.json
   You're all set! Try 'twitter tl' to see your timeline.
 ```
 
-Credentials are stored in `~/.config/twitter-cli/auth.json` with `600`
-permissions. These are session cookies — they expire when you log out or after
-extended inactivity. Just re-run `twitter setup` if that happens.
+Credentials are stored in `~/.config/twitter-cli/credentials.json` with `600`
+permissions (respects `XDG_CONFIG_HOME`). These are session cookies — they
+expire when you log out or after extended inactivity. Just re-run `twitter
+setup` if that happens.
 
 ### 3. Use it
 
@@ -217,9 +218,8 @@ Then update the `Q` dict in `bin/twitter` with the new hashes.
 
 ## Configuration
 
-| Item | Default | Override |
-|---|---|---|
-| Auth file | `~/.config/twitter-cli/auth.json` | `TWITTER_AUTH_FILE` env var |
+Credentials are stored at `$XDG_CONFIG_HOME/twitter-cli/credentials.json`
+(defaults to `~/.config/twitter-cli/credentials.json`).
 
 ## Troubleshooting
 

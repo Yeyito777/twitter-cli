@@ -1,14 +1,14 @@
 """Twitter auth token management.
 
-Tokens are stored in ~/.config/twitter-cli/auth.json after running 'twitter setup'.
-The config path can be overridden with the TWITTER_AUTH_FILE environment variable.
+Credentials are stored in $XDG_CONFIG_HOME/twitter-cli/credentials.json
+(defaults to ~/.config/twitter-cli/credentials.json).
+
+Run 'twitter setup' to configure.
 """
 
 import json
 import os
 from pathlib import Path
-
-DEFAULT_AUTH_FILE = Path.home() / ".config" / "twitter-cli" / "auth.json"
 
 # Static — same for all Twitter web users (this is the web app's client token)
 BEARER_TOKEN = (
@@ -17,52 +17,26 @@ BEARER_TOKEN = (
 )
 
 
-def _auth_file():
-    """Return the path to the auth file, respecting TWITTER_AUTH_FILE env var."""
-    return Path(os.environ.get("TWITTER_AUTH_FILE", str(DEFAULT_AUTH_FILE)))
+def _config_dir():
+    """Return the twitter-cli config directory, respecting XDG_CONFIG_HOME."""
+    xdg = os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))
+    return Path(xdg) / "twitter-cli"
 
 
-def _try_qutebrowser():
-    """Try to extract tokens from qutebrowser's cookie store (fallback).
-
-    Returns a dict with auth_token and ct0 if found, None otherwise.
-    """
-    try:
-        import sqlite3
-        cookie_db = Path.home() / ".runtime/qutebrowser-mnemo/data/webengine/Cookies"
-        if not cookie_db.exists():
-            return None
-        conn = sqlite3.connect(f"file:{cookie_db}?mode=ro", uri=True)
-        try:
-            rows = conn.execute(
-                "SELECT name, value FROM cookies "
-                "WHERE host_key LIKE '%x.com%' AND name IN ('auth_token', 'ct0')"
-            ).fetchall()
-        finally:
-            conn.close()
-        tokens = {name: value for name, value in rows}
-        if tokens.get("auth_token") and tokens.get("ct0"):
-            return tokens
-    except Exception:
-        pass
-    return None
+def _credentials_file():
+    """Return the path to credentials.json."""
+    return _config_dir() / "credentials.json"
 
 
 def get_tokens():
-    """Load auth_token and ct0 from the auth file.
-
-    Falls back to extracting from qutebrowser's cookie store if available.
+    """Load auth_token and ct0 from credentials.json.
 
     Returns a dict with keys: auth_token, ct0, bearer.
-    Raises RuntimeError if tokens are missing or the file doesn't exist.
+    Raises RuntimeError if credentials are missing or the file doesn't exist.
     """
-    path = _auth_file()
+    path = _credentials_file()
 
     if not path.exists():
-        # Fallback: try qutebrowser cookie store
-        qb_tokens = _try_qutebrowser()
-        if qb_tokens:
-            return {**qb_tokens, "bearer": BEARER_TOKEN}
         raise RuntimeError(
             "Not authenticated. Run 'twitter setup' to configure your credentials."
         )
@@ -70,7 +44,7 @@ def get_tokens():
     try:
         data = json.loads(path.read_text())
     except (json.JSONDecodeError, OSError) as e:
-        raise RuntimeError(f"Failed to read auth file {path}: {e}")
+        raise RuntimeError(f"Failed to read credentials file {path}: {e}")
 
     tokens = {
         "auth_token": data.get("auth_token", ""),
@@ -81,7 +55,7 @@ def get_tokens():
     missing = [k for k in ("auth_token", "ct0") if not tokens[k]]
     if missing:
         raise RuntimeError(
-            f"Auth file is missing: {', '.join(missing)}. "
+            f"Credentials file is missing: {', '.join(missing)}. "
             "Run 'twitter setup' to reconfigure."
         )
 
@@ -89,12 +63,12 @@ def get_tokens():
 
 
 def save_tokens(auth_token, ct0):
-    """Save auth tokens to the auth file.
+    """Save auth tokens to credentials.json.
 
     Creates the config directory if it doesn't exist.
     Sets restrictive file permissions (600) since these are credentials.
     """
-    path = _auth_file()
+    path = _credentials_file()
     path.parent.mkdir(parents=True, exist_ok=True)
 
     data = {"auth_token": auth_token, "ct0": ct0}
@@ -137,7 +111,7 @@ def setup_interactive():
         return False
 
     save_tokens(auth_token, ct0)
-    path = _auth_file()
+    path = _credentials_file()
     print()
     print(f"  ✓ Credentials saved to {path}")
     print("  You're all set! Try 'twitter tl' to see your timeline.")
