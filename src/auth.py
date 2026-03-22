@@ -72,6 +72,11 @@ def _save_tokens(auth_token, ct0):
 
 def login(argv):
     """Interactive setup — configure auth credentials."""
+    import argparse
+    p = argparse.ArgumentParser(prog="twitter login",
+        description="Authenticate by pasting browser cookies from x.com.")
+    p.parse_args(argv)
+
     print()
     print("  twitter login")
     print("  ─────────────")
