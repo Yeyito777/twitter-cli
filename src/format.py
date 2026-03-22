@@ -1,7 +1,5 @@
 """Format parsed Twitter data for terminal output."""
 
-import json
-
 
 def _compact_number(n):
     """Format large numbers compactly: 1234 -> 1.2K, 1234567 -> 1.2M."""
@@ -123,6 +121,3 @@ def format_timeline(items, cursors=None):
     return output
 
 
-def format_json(data):
-    """Format data as pretty JSON."""
-    return json.dumps(data, indent=2, ensure_ascii=False)

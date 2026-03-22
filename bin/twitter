@@ -44,9 +44,6 @@ commands:
     login                Set up credentials (paste browser cookies)
     logout               Remove stored credentials
 
-Global flags:
-  --json                 JSON output (works on all commands)
-
 Run 'twitter <command> --help' for command-specific usage.
 EOF
 }
@@ -54,17 +51,6 @@ EOF
 if [[ $# -eq 0 ]]; then
     usage
     exit 1
-fi
-
-# Handle --json before the command (twitter --json timeline ...)
-json_flag=""
-if [[ "$1" == "--json" ]]; then
-    json_flag="--json"
-    shift
-    if [[ $# -eq 0 ]]; then
-        usage
-        exit 1
-    fi
 fi
 
 cmd="$1"; shift
@@ -83,11 +69,11 @@ esac
 
 case "$cmd" in
     timeline|tweet|search|profile|tweets|thread|notifications|bookmarks|trending|dms|dm)
-        exec "$PYTHON" -c "import sys; from src.reading import $cmd; $cmd(sys.argv[1:])" $json_flag "$@" ;;
+        exec "$PYTHON" -c "import sys; from src.reading import $cmd; $cmd(sys.argv[1:])" "$@" ;;
     post|reply|delete)
-        exec "$PYTHON" -c "import sys; from src.posting import $cmd; $cmd(sys.argv[1:])" $json_flag "$@" ;;
+        exec "$PYTHON" -c "import sys; from src.posting import $cmd; $cmd(sys.argv[1:])" "$@" ;;
     like|unlike|rt|unrt|bookmark|unbookmark|follow|unfollow|mute|unmute|block|unblock)
-        exec "$PYTHON" -c "import sys; from src.engagement import $cmd; $cmd(sys.argv[1:])" $json_flag "$@" ;;
+        exec "$PYTHON" -c "import sys; from src.engagement import $cmd; $cmd(sys.argv[1:])" "$@" ;;
     login|logout)
         exec "$PYTHON" -c "import sys; from src.auth import $cmd; $cmd(sys.argv[1:])" "$@" ;;
     help|--help|-h)

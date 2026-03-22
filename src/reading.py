@@ -5,7 +5,7 @@ import sys
 
 from src.api import graphql_get, rest_get
 from src.parse import parse_timeline_entries, parse_tweet
-from src.format import format_timeline, format_tweet, format_json
+from src.format import format_timeline, format_tweet
 from src.helpers import (
     Q, DM_PARAMS, require_tweet_ref, compact_num, resolve_user_id,
     format_dm_time,
@@ -18,7 +18,6 @@ def timeline(argv):
     p.add_argument("-n", "--count", type=int, default=20, help="Number of tweets")
     p.add_argument("-c", "--cursor", type=str, help="Pagination cursor")
     p.add_argument("-l", "--latest", action="store_true", help="Chronological instead of algorithmic")
-    p.add_argument("--json", action="store_true", help="Output as JSON")
     args = p.parse_args(argv)
 
     variables = {
@@ -36,17 +35,13 @@ def timeline(argv):
     entries = data["data"]["home"]["home_timeline_urt"]["instructions"][0]["entries"]
     tweets, cursors = parse_timeline_entries(entries)
 
-    if args.json:
-        print(format_json(tweets))
-    else:
-        print(format_timeline(tweets, cursors))
+    print(format_timeline(tweets, cursors))
 
 
 def tweet(argv):
     """View a single tweet by ID or URL."""
     p = argparse.ArgumentParser(prog="twitter tweet")
     p.add_argument("tweet", help="Tweet ID or URL")
-    p.add_argument("--json", action="store_true", help="Output as JSON")
     args = p.parse_args(argv)
 
     tweet_id = require_tweet_ref(args.tweet)
@@ -62,9 +57,7 @@ def tweet(argv):
     result = data.get("data", {}).get("tweetResult", {}).get("result")
     parsed = parse_tweet(result)
 
-    if args.json:
-        print(format_json(parsed or data))
-    elif parsed:
+    if parsed:
         print(format_tweet(parsed))
     else:
         print("Tweet not found or could not be parsed.")
@@ -77,7 +70,6 @@ def search(argv):
     p.add_argument("-n", "--count", type=int, default=20, help="Number of results")
     p.add_argument("-c", "--cursor", type=str, help="Pagination cursor")
     p.add_argument("-l", "--latest", action="store_true", help="Sort by latest")
-    p.add_argument("--json", action="store_true", help="Output as JSON")
     args = p.parse_args(argv)
 
     query = " ".join(args.query)
@@ -109,20 +101,16 @@ def search(argv):
 
     tweets, cursors = parse_timeline_entries(entries)
 
-    if args.json:
-        print(format_json(tweets))
+    if not tweets:
+        print(f"No results for: {query}")
     else:
-        if not tweets:
-            print(f"No results for: {query}")
-        else:
-            print(format_timeline(tweets, cursors))
+        print(format_timeline(tweets, cursors))
 
 
 def profile(argv):
     """View a user's profile info."""
     p = argparse.ArgumentParser(prog="twitter profile")
     p.add_argument("user", help="Username (with or without @)")
-    p.add_argument("--json", action="store_true", help="Output as JSON")
     args = p.parse_args(argv)
 
     screen_name = args.user.lstrip("@")
@@ -134,10 +122,6 @@ def profile(argv):
 
     if not user_result:
         print(f"User @{screen_name} not found.")
-        return
-
-    if args.json:
-        print(format_json(user_result))
         return
 
     user_core = user_result.get("core", {})
@@ -181,7 +165,6 @@ def tweets(argv):
     p.add_argument("-n", "--count", type=int, default=20, help="Number of tweets")
     p.add_argument("-c", "--cursor", type=str, help="Pagination cursor")
     p.add_argument("--replies", action="store_true", help="Include replies")
-    p.add_argument("--json", action="store_true", help="Output as JSON")
     args = p.parse_args(argv)
 
     user_id, user_result = resolve_user_id(args.user)
@@ -215,20 +198,16 @@ def tweets(argv):
 
     items, cursors = parse_timeline_entries(entries)
 
-    if args.json:
-        print(format_json(items))
+    if not items:
+        print(f"No tweets found for @{args.user.lstrip('@')}")
     else:
-        if not items:
-            print(f"No tweets found for @{args.user.lstrip('@')}")
-        else:
-            print(format_timeline(items, cursors))
+        print(format_timeline(items, cursors))
 
 
 def thread(argv):
     """View a full thread/conversation around a tweet."""
     p = argparse.ArgumentParser(prog="twitter thread")
     p.add_argument("tweet", help="Tweet ID or URL (any tweet in the thread)")
-    p.add_argument("--json", action="store_true", help="Output as JSON")
     args = p.parse_args(argv)
 
     tweet_id = require_tweet_ref(args.tweet)
@@ -260,13 +239,10 @@ def thread(argv):
 
     items, cursors = parse_timeline_entries(entries)
 
-    if args.json:
-        print(format_json(items))
+    if not items:
+        print("Thread not found or could not be parsed.")
     else:
-        if not items:
-            print("Thread not found or could not be parsed.")
-        else:
-            print(format_timeline(items, cursors))
+        print(format_timeline(items, cursors))
 
 
 def notifications(argv):
@@ -274,7 +250,6 @@ def notifications(argv):
     p = argparse.ArgumentParser(prog="twitter notifications")
     p.add_argument("-n", "--count", type=int, default=20, help="Number of notifications")
     p.add_argument("-c", "--cursor", type=str, help="Pagination cursor")
-    p.add_argument("--json", action="store_true", help="Output as JSON")
     args = p.parse_args(argv)
 
     variables = {
@@ -303,13 +278,10 @@ def notifications(argv):
 
     items, cursors = parse_timeline_entries(entries)
 
-    if args.json:
-        print(format_json(items))
+    if not items:
+        print("No notifications found.")
     else:
-        if not items:
-            print("No notifications found.")
-        else:
-            print(format_timeline(items, cursors))
+        print(format_timeline(items, cursors))
 
 
 def bookmarks(argv):
@@ -317,7 +289,6 @@ def bookmarks(argv):
     p = argparse.ArgumentParser(prog="twitter bookmarks")
     p.add_argument("-n", "--count", type=int, default=20, help="Number of bookmarks")
     p.add_argument("-c", "--cursor", type=str, help="Pagination cursor")
-    p.add_argument("--json", action="store_true", help="Output as JSON")
     args = p.parse_args(argv)
 
     variables = {
@@ -343,20 +314,16 @@ def bookmarks(argv):
 
     items, cursors = parse_timeline_entries(entries)
 
-    if args.json:
-        print(format_json(items))
+    if not items:
+        print("No bookmarks found.")
     else:
-        if not items:
-            print("No bookmarks found.")
-        else:
-            print(format_timeline(items, cursors))
+        print(format_timeline(items, cursors))
 
 
 def trending(argv):
     """View trending topics."""
     p = argparse.ArgumentParser(prog="twitter trending")
     p.add_argument("-n", "--count", type=int, default=20, help="Number of trends")
-    p.add_argument("--json", action="store_true", help="Output as JSON")
     args = p.parse_args(argv)
 
     # Step 1: fetch ExplorePage to get the trending timeline ID
@@ -402,19 +369,15 @@ def trending(argv):
 
     items, cursors = parse_timeline_entries(entries)
 
-    if args.json:
-        print(format_json(items))
+    if not items:
+        print("No trending topics found.")
     else:
-        if not items:
-            print("No trending topics found.")
-        else:
-            print(format_timeline(items, cursors))
+        print(format_timeline(items, cursors))
 
 
 def dms(argv):
     """List DM conversations."""
     p = argparse.ArgumentParser(prog="twitter dms")
-    p.add_argument("--json", action="store_true", help="Output as JSON")
     args = p.parse_args(argv)
 
     data = rest_get("/1.1/dm/inbox_initial_state.json", DM_PARAMS)
@@ -463,24 +426,21 @@ def dms(argv):
             "type": conv.get("type", ""),
         })
 
-    if args.json:
-        print(format_json(results))
+    if not results:
+        print("No conversations found.")
     else:
-        if not results:
-            print("No conversations found.")
-        else:
-            for r in results:
-                names = " & ".join(
-                    f"@{pt['handle']} ({pt['name']})" for pt in r["participants"]
-                )
-                print(f"💬 {names}")
-                print(f"   ID: {r['conversation_id']}")
-                if r["last_message"]:
-                    preview = r["last_message"][:100]
-                    if len(r["last_message"]) > 100:
-                        preview += "..."
-                    print(f"   [{r['last_time']}] @{r['last_sender']}: {preview}")
-                print()
+        for r in results:
+            names = " & ".join(
+                f"@{pt['handle']} ({pt['name']})" for pt in r["participants"]
+            )
+            print(f"💬 {names}")
+            print(f"   ID: {r['conversation_id']}")
+            if r["last_message"]:
+                preview = r["last_message"][:100]
+                if len(r["last_message"]) > 100:
+                    preview += "..."
+                print(f"   [{r['last_time']}] @{r['last_sender']}: {preview}")
+            print()
 
 
 def dm(argv):
@@ -488,7 +448,6 @@ def dm(argv):
     p = argparse.ArgumentParser(prog="twitter dm")
     p.add_argument("conversation", help="Conversation ID or @username")
     p.add_argument("-s", "--send", nargs="+", help="Send a message")
-    p.add_argument("--json", action="store_true", help="Output as JSON")
     args = p.parse_args(argv)
 
     # If --send is provided, send a message
@@ -522,25 +481,20 @@ def dm(argv):
             "id": entry.get("message", {}).get("id", ""),
         })
 
-    if args.json:
-        print(format_json(messages))
+    if not messages:
+        print("No messages in this conversation.")
     else:
-        if not messages:
-            print("No messages in this conversation.")
-        else:
-            for m in messages:
-                print(f"[{m['time']}] @{m['sender']}: {m['text']}")
+        for m in messages:
+            print(f"[{m['time']}] @{m['sender']}: {m['text']}")
 
 
 def _resolve_dm_conv_id(ref):
     """Resolve a @username or conversation ID to a conversation ID."""
-    from src.api import rest_get as _rest_get
-
     if ref.replace("-", "").isdigit():
         return ref
 
     user_id, _ = resolve_user_id(ref)
-    data = _rest_get("/1.1/dm/inbox_initial_state.json", DM_PARAMS)
+    data = rest_get("/1.1/dm/inbox_initial_state.json", DM_PARAMS)
     inbox = data.get("inbox_initial_state", {})
     convos = inbox.get("conversations", {})
     for cid, conv in convos.items():
@@ -580,11 +534,8 @@ def _dm_send(args):
                 "cards_platform": "Web-12",
                 "include_cards": 1,
             }
-            result = rest_post("/1.1/dm/new2.json", payload)
-            if args.json:
-                print(format_json(result))
-            else:
-                print("DM sent.")
+            rest_post("/1.1/dm/new2.json", payload)
+            print("DM sent.")
             return
 
     payload = {
@@ -596,9 +547,5 @@ def _dm_send(args):
         "dm_users": False,
     }
 
-    result = rest_post("/1.1/dm/new2.json", payload)
-
-    if args.json:
-        print(format_json(result))
-    else:
-        print(f"DM sent.")
+    rest_post("/1.1/dm/new2.json", payload)
+    print("DM sent.")

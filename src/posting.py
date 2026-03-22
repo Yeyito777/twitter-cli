@@ -5,7 +5,7 @@ import sys
 
 from src.api import graphql_post
 from src.parse import parse_tweet
-from src.format import format_tweet, format_json
+from src.format import format_tweet
 from src.helpers import Q, require_tweet_ref
 
 
@@ -15,7 +15,6 @@ def post(argv):
     p.add_argument("text", nargs="+", help="Tweet text")
     p.add_argument("-r", "--reply", type=str, help="Tweet ID/URL to reply to")
     p.add_argument("-q", "--quote", type=str, help="Tweet ID/URL to quote")
-    p.add_argument("--json", action="store_true", help="Output as JSON")
     args = p.parse_args(argv)
 
     text = " ".join(args.text)
@@ -49,7 +48,7 @@ def post(argv):
         .get("tweet_results", {})
         .get("result", {})
     )
-    tweet = parse_tweet(result)
+    parsed = parse_tweet(result)
 
     # Check for errors in the response
     errors = data.get("errors", [])
@@ -58,11 +57,9 @@ def post(argv):
             print(f"Error: {err.get('message', 'Unknown error')}", file=sys.stderr)
         sys.exit(1)
 
-    if args.json:
-        print(format_json(tweet or data))
-    elif tweet:
+    if parsed:
         print("Posted:")
-        print(format_tweet(tweet))
+        print(format_tweet(parsed))
     else:
         fallback_id = (
             data.get("data", {})
@@ -82,21 +79,16 @@ def reply(argv):
     p = argparse.ArgumentParser(prog="twitter reply")
     p.add_argument("tweet", help="Tweet ID or URL to reply to")
     p.add_argument("text", nargs="+", help="Reply text")
-    p.add_argument("--json", action="store_true", help="Output as JSON")
     args = p.parse_args(argv)
 
     # Rewrite as a post --reply call
-    post_argv = args.text + ["--reply", args.tweet]
-    if args.json:
-        post_argv.append("--json")
-    post(post_argv)
+    post(args.text + ["--reply", args.tweet])
 
 
 def delete(argv):
     """Delete one of your own tweets."""
     p = argparse.ArgumentParser(prog="twitter delete")
     p.add_argument("tweet", help="Tweet ID or URL")
-    p.add_argument("--json", action="store_true", help="Output as JSON")
     args = p.parse_args(argv)
 
     tweet_id = require_tweet_ref(args.tweet)
@@ -104,7 +96,4 @@ def delete(argv):
         Q["DeleteTweet"], "DeleteTweet",
         {"tweet_id": tweet_id, "dark_request": False},
     )
-    if args.json:
-        print(format_json({"deleted": tweet_id}))
-    else:
-        print(f"Deleted.")
+    print("Deleted.")
