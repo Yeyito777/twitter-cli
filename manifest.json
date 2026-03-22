@@ -1,0 +1,9 @@
+{
+  "name": "twitter",
+  "bin": "./bin/twitter",
+  "systemHint": "You have access to the user's Twitter/X through the `twitter` CLI tool (source at ~/Workspace/Exocortex/external-tools/twitter-cli). Run `twitter -h` for usage reference.",
+  "display": {
+    "label": "Twitter",
+    "color": "#1DA1F2"
+  }
+}

@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# Twitter CLI — terminal client for X/Twitter.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+PYTHON="$PROJECT_DIR/.venv/bin/python3"
+
+export PYTHONPATH="$PROJECT_DIR"
+
+usage() {
+    cat <<'EOF'
+usage: twitter <command> [args]
+
+commands:
+  Reading:
+    timeline, tl         Home feed (--latest for chronological)
+    tweet <id_or_url>    View a single tweet
+    search, s <query>    Search tweets
+    profile, p <@user>   View a user's profile
+    tweets <@user>       View a user's tweets (--replies)
+    thread <id_or_url>   View a full thread/conversation
+    notifications, notif Recent notifications
+    bookmarks, bms       List bookmarked tweets
+    trending             Trending topics
+    dms                  List DM conversations
+    dm <@user_or_id>     Read/send a DM conversation
+
+  Posting:
+    post <text>          Post a tweet (--reply, --quote)
+    reply <tweet> <text> Reply to a tweet
+    delete <id_or_url>   Delete one of your own tweets
+
+  Engagement:
+    like / unlike        Like or unlike a tweet
+    rt / unrt            Retweet or undo a retweet
+    bookmark, bm         Bookmark a tweet
+    unbookmark, ubm      Remove a bookmark
+    follow / unfollow    Follow or unfollow a user
+    mute / unmute        Mute or unmute a user
+    block / unblock      Block or unblock a user
+
+  Auth:
+    login                Set up credentials (paste browser cookies)
+    logout               Remove stored credentials
+
+Global flags:
+  --json                 JSON output (works on all commands)
+
+Run 'twitter <command> --help' for command-specific usage.
+EOF
+}
+
+if [[ $# -eq 0 ]]; then
+    usage
+    exit 1
+fi
+
+# Handle --json before the command (twitter --json timeline ...)
+json_flag=""
+if [[ "$1" == "--json" ]]; then
+    json_flag="--json"
+    shift
+    if [[ $# -eq 0 ]]; then
+        usage
+        exit 1
+    fi
+fi
+
+cmd="$1"; shift
+
+# Resolve aliases
+case "$cmd" in
+    tl)    cmd="timeline" ;;
+    s)     cmd="search" ;;
+    p)     cmd="profile" ;;
+    notif) cmd="notifications" ;;
+    bms)   cmd="bookmarks" ;;
+    bm)    cmd="bookmark" ;;
+    ubm)   cmd="unbookmark" ;;
+    setup|auth) cmd="login" ;;
+esac
+
+case "$cmd" in
+    timeline|tweet|search|profile|tweets|thread|notifications|bookmarks|trending|dms|dm)
+        exec "$PYTHON" -c "import sys; from src.reading import $cmd; $cmd(sys.argv[1:])" $json_flag "$@" ;;
+    post|reply|delete)
+        exec "$PYTHON" -c "import sys; from src.posting import $cmd; $cmd(sys.argv[1:])" $json_flag "$@" ;;
+    like|unlike|rt|unrt|bookmark|unbookmark|follow|unfollow|mute|unmute|block|unblock)
+        exec "$PYTHON" -c "import sys; from src.engagement import $cmd; $cmd(sys.argv[1:])" $json_flag "$@" ;;
+    login|logout)
+        exec "$PYTHON" -c "import sys; from src.auth import $cmd; $cmd(sys.argv[1:])" "$@" ;;
+    help|--help|-h)
+        usage ;;
+    *)
+        echo "twitter: unknown command '$cmd'" >&2
+        echo "Run 'twitter --help' for usage." >&2
+        exit 1 ;;
+esac
