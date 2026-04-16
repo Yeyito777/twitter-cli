@@ -44,6 +44,9 @@ commands:
     login                Set up credentials (paste browser cookies)
     logout               Remove stored credentials
 
+  Notify:
+    notify               Manage reply/quote relay into exo conversations
+
 Run 'twitter <command> --help' for command-specific usage.
 EOF
 }
@@ -76,6 +79,8 @@ case "$cmd" in
         exec "$PYTHON" -c "import sys; from src.engagement import $cmd; $cmd(sys.argv[1:])" "$@" ;;
     login|logout)
         exec "$PYTHON" -c "import sys; from src.auth import $cmd; $cmd(sys.argv[1:])" "$@" ;;
+    notify)
+        exec "$PYTHON" -c "import sys; from src.notify import dispatch; dispatch('notify', sys.argv[1:])" "$@" ;;
     help|--help|-h)
         usage ;;
     *)

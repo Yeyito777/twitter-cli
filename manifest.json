@@ -5,5 +5,9 @@
   "display": {
     "label": "Twitter",
     "color": "#1DA1F2"
+  },
+  "daemon": {
+    "command": ".venv/bin/python3 -m src.notify __run__ /tmp/twitter-listeners/__notify__.log",
+    "restart": "on-failure"
   }
 }
