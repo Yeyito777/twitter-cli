@@ -147,6 +147,30 @@ def _find_notify_pid():
     return pids[0] if pids else None
 
 
+def _stop_notify_pids(pids, *, verbose=True):
+    stopped = []
+    already_stopped = []
+    for pid in sorted(set(pids)):
+        try:
+            os.kill(pid, signal.SIGTERM)
+            for _ in range(10):
+                time.sleep(0.5)
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    break
+            else:
+                os.kill(pid, signal.SIGKILL)
+            stopped.append(pid)
+            if verbose:
+                print(f"  Stopped notify listener (PID {pid})")
+        except ProcessLookupError:
+            already_stopped.append(pid)
+            if verbose:
+                print(f"  Notify listener already stopped (PID {pid})")
+    return stopped, already_stopped
+
+
 class TwitterNotifyService:
     def __init__(self, log_file, relay_targets=None):
         self.log_file = Path(log_file)
@@ -680,16 +704,12 @@ def start(argv):
 
     existing_pids = _find_notify_pids()
     if existing_pids:
-        pid_file.write_text(str(existing_pids[0]))
         print(
-            f"  Notify listener already running ({len(existing_pids)} instance"
-            f"{'s' if len(existing_pids) != 1 else ''})"
+            f"  Found {len(existing_pids)} existing notify listener"
+            f"{'s' if len(existing_pids) != 1 else ''}; restarting cleanly"
         )
-        print(f"  PIDs: {', '.join(str(pid) for pid in existing_pids)}")
-        if len(existing_pids) > 1:
-            print("  Run `twitter notify stop` to clean up duplicates.")
-        print(f"  Relay targets read from {CONFIG_FILE} at startup.")
-        return
+        print(f"  Existing PIDs: {', '.join(str(pid) for pid in existing_pids)}")
+        _stop_notify_pids(existing_pids)
 
     pid_file.unlink(missing_ok=True)
 
@@ -743,20 +763,7 @@ def stop(argv):
         print("  Notify listener not running")
         return
 
-    for pid in sorted(pids):
-        try:
-            os.kill(pid, signal.SIGTERM)
-            for _ in range(10):
-                time.sleep(0.5)
-                try:
-                    os.kill(pid, 0)
-                except ProcessLookupError:
-                    break
-            else:
-                os.kill(pid, signal.SIGKILL)
-            print(f"  Stopped notify listener (PID {pid})")
-        except ProcessLookupError:
-            print(f"  Notify listener already stopped (PID {pid})")
+    _stop_notify_pids(pids)
 
     pid_file.unlink(missing_ok=True)
     meta_file.unlink(missing_ok=True)
