@@ -1,6 +1,7 @@
 """Notify subcommands — manage Twitter reply/quote relay."""
 
 import argparse
+import fcntl
 import json
 import os
 import signal
@@ -20,12 +21,15 @@ CONFIG_DIR = PROJECT_ROOT / "config"
 CONFIG_FILE = CONFIG_DIR / "notify.json"
 STATE_FILE = CONFIG_DIR / "notify-state.json"
 LISTENER_DIR = Path("/tmp/twitter-listeners")
+LOCK_FILE = LISTENER_DIR / "__notify__.lock"
+EXO_REPO_ROOT = PROJECT_ROOT.parents[1]
 
 DEFAULT_POLL_SECONDS = 300
 DEFAULT_MAX_PARENT_REPLIES = 10  # exclusive upper bound: relay when parent replies < 10
 DEFAULT_FETCH_COUNT = 50
 MAX_SEEN_IDS = 1000
 MAX_RELAYED_IDS = 1000
+MAX_PENDING_EVENTS = 200
 
 
 def _read_json_file(path, default=None):
@@ -63,13 +67,48 @@ def _save_config(cfg):
     CONFIG_FILE.write_text(json.dumps(cfg, indent=2) + "\n")
 
 
+def _dedupe_tail(items, limit):
+    seen = set()
+    out = []
+    for item in reversed(list(items or [])):
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return list(reversed(out))[-limit:]
+
+
+def _normalize_relay_map(raw):
+    result = {}
+    if not isinstance(raw, dict):
+        return result
+    for conv_id, tweet_ids in raw.items():
+        if not conv_id:
+            continue
+        result[str(conv_id)] = _dedupe_tail([str(t) for t in (tweet_ids or []) if t], MAX_RELAYED_IDS)
+    return result
+
+
+def _normalize_pending_events(raw):
+    result = {}
+    if not isinstance(raw, dict):
+        return result
+    for tweet_id, event in list(raw.items())[-MAX_PENDING_EVENTS:]:
+        if not tweet_id or not isinstance(event, dict):
+            continue
+        result[str(tweet_id)] = event
+    return result
+
+
 def _load_state():
     state = _read_json_file(STATE_FILE)
 
     return {
         "initialized": bool(state.get("initialized", False)),
-        "seen_entry_ids": list(state.get("seen_entry_ids", []))[-MAX_SEEN_IDS:],
-        "relayed_tweet_ids": list(state.get("relayed_tweet_ids", []))[-MAX_RELAYED_IDS:],
+        "seen_entry_ids": _dedupe_tail(state.get("seen_entry_ids", []), MAX_SEEN_IDS),
+        "relayed_tweet_ids": _dedupe_tail(state.get("relayed_tweet_ids", []), MAX_RELAYED_IDS),
+        "relayed_by_target": _normalize_relay_map(state.get("relayed_by_target", {})),
+        "pending_events": _normalize_pending_events(state.get("pending_events", {})),
         "last_poll": state.get("last_poll", ""),
     }
 
@@ -77,8 +116,10 @@ def _load_state():
 def _save_state(state):
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     state = dict(state)
-    state["seen_entry_ids"] = list(state.get("seen_entry_ids", []))[-MAX_SEEN_IDS:]
-    state["relayed_tweet_ids"] = list(state.get("relayed_tweet_ids", []))[-MAX_RELAYED_IDS:]
+    state["seen_entry_ids"] = _dedupe_tail(state.get("seen_entry_ids", []), MAX_SEEN_IDS)
+    state["relayed_tweet_ids"] = _dedupe_tail(state.get("relayed_tweet_ids", []), MAX_RELAYED_IDS)
+    state["relayed_by_target"] = _normalize_relay_map(state.get("relayed_by_target", {}))
+    state["pending_events"] = _normalize_pending_events(state.get("pending_events", {}))
 
     tmp_file = STATE_FILE.with_suffix(".tmp")
     tmp_file.write_text(json.dumps(state, indent=2) + "\n")
@@ -89,17 +130,21 @@ def get_relay_targets():
     return _load_config().get("relay_targets", [])
 
 
-def _find_notify_pid():
+def _find_notify_pids():
     try:
         result = subprocess.run(
             ["pgrep", "-f", r"src\.notify\s+__run__"],
             capture_output=True,
             text=True,
         )
-        pids = [int(p) for p in result.stdout.strip().split() if p.strip()]
-        return pids[0] if pids else None
+        return sorted({int(p) for p in result.stdout.strip().split() if p.strip()})
     except Exception:
-        return None
+        return []
+
+
+def _find_notify_pid():
+    pids = _find_notify_pids()
+    return pids[0] if pids else None
 
 
 class TwitterNotifyService:
@@ -112,12 +157,60 @@ class TwitterNotifyService:
         self.max_parent_replies = max(1, int(self.cfg.get("max_parent_replies", DEFAULT_MAX_PARENT_REPLIES)))
         self.fetch_count = DEFAULT_FETCH_COUNT
         self.state = _load_state()
+        self.state.setdefault("relayed_by_target", {})
+        self.state.setdefault("pending_events", {})
         self.self_profile = self._get_self_profile()
         self.self_handle = self.self_profile.get("screen_name", "").lstrip("@").lower()
         self.self_name = self.self_profile.get("name", self.self_handle)
+        self.lock_handle = None
 
         signal.signal(signal.SIGTERM, self._shutdown)
         signal.signal(signal.SIGINT, self._shutdown)
+
+    def _acquire_lock(self):
+        LISTENER_DIR.mkdir(parents=True, exist_ok=True)
+        self.lock_handle = LOCK_FILE.open("a+")
+        try:
+            fcntl.flock(self.lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            owner = ""
+            try:
+                self.lock_handle.seek(0)
+                owner = self.lock_handle.read().strip()
+            except OSError:
+                owner = ""
+            self._log(
+                "Another notify service already holds the listener lock"
+                f"{f' ({owner})' if owner else ''}; exiting"
+            )
+            try:
+                self.lock_handle.close()
+            except OSError:
+                pass
+            self.lock_handle = None
+            return False
+
+        self.lock_handle.seek(0)
+        self.lock_handle.truncate()
+        self.lock_handle.write(str(os.getpid()))
+        self.lock_handle.flush()
+        return True
+
+    def _release_lock(self):
+        if not self.lock_handle:
+            return
+        try:
+            self.lock_handle.seek(0)
+            self.lock_handle.truncate()
+            self.lock_handle.flush()
+            fcntl.flock(self.lock_handle.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            self.lock_handle.close()
+        except OSError:
+            pass
+        self.lock_handle = None
 
     def _shutdown(self, signum=None, frame=None):
         sig_name = signal.Signals(signum).name if signum else "?"
@@ -353,32 +446,83 @@ class TwitterNotifyService:
     def _indent(self, text, prefix="  "):
         return "\n".join(prefix + line if line else prefix.rstrip() for line in text.splitlines())
 
-    def _relay_event(self, event):
+    def _relay_event(self, event, relay_targets=None):
         msg = self._format_event_message(event)
         incoming_id = event["incoming_tweet"]["id"]
-        for conv_id in self.relay_targets:
+        success = []
+        failed = []
+        targets = list(relay_targets or self.relay_targets)
+
+        for conv_id in targets:
             try:
                 result = subprocess.run(
                     ["exo", "send", msg, "-c", conv_id, "--timeout", "600"],
                     capture_output=True,
                     text=True,
                     timeout=660,
+                    cwd=str(EXO_REPO_ROOT),
                 )
                 if result.returncode != 0:
+                    failed.append(conv_id)
                     self._log(
                         f"Relay failed for tweet {incoming_id} to {conv_id}: "
                         f"{result.stderr.strip()[:300]}"
                     )
                 else:
+                    success.append(conv_id)
                     out = (result.stdout or "").strip()
                     if "queued" in out.lower():
                         self._log(f"Relayed tweet {incoming_id} to {conv_id}: auto-queued")
                     else:
                         self._log(f"Relayed tweet {incoming_id} to {conv_id}: delivered")
             except subprocess.TimeoutExpired:
+                failed.append(conv_id)
                 self._log(f"Relay timed out for tweet {incoming_id} to {conv_id}")
             except Exception as e:
+                failed.append(conv_id)
                 self._log(f"Relay error for tweet {incoming_id} to {conv_id}: {e}")
+
+        return success, failed
+
+    def _pending_targets_for(self, incoming_id):
+        relay_map = self.state.setdefault("relayed_by_target", {})
+        pending = []
+        for conv_id in self.relay_targets:
+            delivered = set(relay_map.get(conv_id, []))
+            if incoming_id not in delivered:
+                pending.append(conv_id)
+        return pending
+
+    def _mark_delivery_success(self, incoming_id, success_targets):
+        relay_map = self.state.setdefault("relayed_by_target", {})
+        for conv_id in success_targets:
+            delivered = relay_map.setdefault(conv_id, [])
+            delivered.append(incoming_id)
+
+    def _mark_fully_relayed(self, incoming_id):
+        self.state.setdefault("relayed_tweet_ids", []).append(incoming_id)
+        self.state.setdefault("pending_events", {}).pop(incoming_id, None)
+
+    def _attempt_event_relay(self, event):
+        incoming_id = event["incoming_tweet"].get("id")
+        if not incoming_id:
+            return False
+
+        pending_targets = self._pending_targets_for(incoming_id)
+        if not pending_targets:
+            self._mark_fully_relayed(incoming_id)
+            return False
+
+        success_targets, failed_targets = self._relay_event(event, pending_targets)
+        if success_targets:
+            self._mark_delivery_success(incoming_id, success_targets)
+
+        if failed_targets:
+            self.state.setdefault("pending_events", {})[incoming_id] = event
+            return False
+
+        self._mark_fully_relayed(incoming_id)
+        return True
 
     def poll_once(self):
         entries = self._fetch_notification_entries()
@@ -390,55 +534,67 @@ class TwitterNotifyService:
             self.state["last_poll"] = time.strftime("%Y-%m-%dT%H:%M:%S")
             _save_state(self.state)
             self._log(f"Primed state with {len(entry_ids)} existing notifications; no relays sent")
-            return {"primed": len(entry_ids), "relayed": 0, "new_entries": 0}
+            return {"primed": len(entry_ids), "relayed": 0, "new_entries": 0, "pending": 0}
 
         seen_entry_ids = set(self.state.get("seen_entry_ids", []))
-        relayed_tweet_ids = set(self.state.get("relayed_tweet_ids", []))
         new_entries = [e for e in entries if e.get("entryId") and e.get("entryId") not in seen_entry_ids]
 
         relayed = 0
+
+        pending_events = dict(self.state.get("pending_events", {}))
+        for incoming_id, event in pending_events.items():
+            if self._attempt_event_relay(event):
+                relayed += 1
+
         for entry in reversed(new_entries):
             event = self._extract_event_from_entry(entry)
             if not event:
                 continue
             incoming_id = event["incoming_tweet"].get("id")
-            if not incoming_id or incoming_id in relayed_tweet_ids:
+            if not incoming_id:
                 continue
-            self._relay_event(event)
-            self.state.setdefault("relayed_tweet_ids", []).append(incoming_id)
-            relayed_tweet_ids.add(incoming_id)
-            relayed += 1
+            if self._attempt_event_relay(event):
+                relayed += 1
 
         self.state.setdefault("seen_entry_ids", []).extend(entry_ids)
-        self.state["seen_entry_ids"] = self.state["seen_entry_ids"][-MAX_SEEN_IDS:]
-        self.state["relayed_tweet_ids"] = self.state.get("relayed_tweet_ids", [])[-MAX_RELAYED_IDS:]
         self.state["last_poll"] = time.strftime("%Y-%m-%dT%H:%M:%S")
         _save_state(self.state)
-        return {"primed": 0, "relayed": relayed, "new_entries": len(new_entries)}
+        return {
+            "primed": 0,
+            "relayed": relayed,
+            "new_entries": len(new_entries),
+            "pending": len(self.state.get("pending_events", {})),
+        }
 
     def run(self):
+        if not self._acquire_lock():
+            return
+
         self._log(
             f"Notify service starting for @{self.self_handle} with "
             f"poll={self.poll_seconds}s threshold=<{self.max_parent_replies} replies "
             f"targets={','.join(self.relay_targets) or '(none)'}"
         )
-        while self.running:
-            try:
-                stats = self.poll_once()
-                if stats["primed"]:
-                    pass
-                elif stats["new_entries"] or stats["relayed"]:
-                    self._log(
-                        f"Poll complete: {stats['new_entries']} new notification entries, "
-                        f"{stats['relayed']} relayed"
-                    )
-            except Exception as e:
-                self._log(f"Poll error: {e}")
-                self._log(traceback.format_exc().rstrip())
-                self._sleep(30)
-                continue
-            self._sleep(self.poll_seconds)
-        self._log("Notify service stopped")
+        try:
+            while self.running:
+                try:
+                    stats = self.poll_once()
+                    if stats["primed"]:
+                        pass
+                    elif stats["new_entries"] or stats["relayed"] or stats["pending"]:
+                        self._log(
+                            f"Poll complete: {stats['new_entries']} new notification entries, "
+                            f"{stats['relayed']} fully relayed, {stats['pending']} pending"
+                        )
+                except Exception as e:
+                    self._log(f"Poll error: {e}")
+                    self._log(traceback.format_exc().rstrip())
+                    self._sleep(30)
+                    continue
+                self._sleep(self.poll_seconds)
+        finally:
+            self._release_lock()
+            self._log("Notify service stopped")
 
 
 def add(argv):
@@ -482,7 +638,7 @@ def list_config(argv):
 
     cfg = _load_config()
     state = _load_state()
-    pid = _find_notify_pid()
+    pids = _find_notify_pids()
 
     print("  Relay targets:")
     targets = cfg.get("relay_targets", [])
@@ -494,9 +650,12 @@ def list_config(argv):
 
     print(f"  Poll interval: {cfg.get('poll_seconds', DEFAULT_POLL_SECONDS)}s")
     print(f"  Parent reply threshold: <{cfg.get('max_parent_replies', DEFAULT_MAX_PARENT_REPLIES)} replies")
-    print(f"  Listener running: {'yes' if pid else 'no'}")
-    if pid:
-        print(f"  PID: {pid}")
+    print(f"  Listener running: {'yes' if pids else 'no'}")
+    if pids:
+        print(f"  PIDs: {', '.join(str(pid) for pid in pids)}")
+        if len(pids) > 1:
+            print("  Warning: multiple notify listeners detected")
+    print(f"  Pending relays: {len(state.get('pending_events', {}))}")
     if state.get("last_poll"):
         print(f"  Last poll: {state['last_poll']}")
 
@@ -519,10 +678,16 @@ def start(argv):
     err_file = paths["err"]
     meta_file = paths["meta"]
 
-    existing_pid = _find_notify_pid()
-    if existing_pid:
-        pid_file.write_text(str(existing_pid))
-        print(f"  Notify listener already running (PID {existing_pid})")
+    existing_pids = _find_notify_pids()
+    if existing_pids:
+        pid_file.write_text(str(existing_pids[0]))
+        print(
+            f"  Notify listener already running ({len(existing_pids)} instance"
+            f"{'s' if len(existing_pids) != 1 else ''})"
+        )
+        print(f"  PIDs: {', '.join(str(pid) for pid in existing_pids)}")
+        if len(existing_pids) > 1:
+            print("  Run `twitter notify stop` to clean up duplicates.")
         print(f"  Relay targets read from {CONFIG_FILE} at startup.")
         return
 
@@ -565,35 +730,33 @@ def stop(argv):
     pid_file = paths["pid"]
     meta_file = paths["meta"]
 
-    pid = None
+    pids = set(_find_notify_pids())
     if pid_file.exists():
         try:
             candidate = int(pid_file.read_text().strip())
             os.kill(candidate, 0)
-            pid = candidate
+            pids.add(candidate)
         except (ProcessLookupError, ValueError):
             pid_file.unlink(missing_ok=True)
 
-    if pid is None:
-        pid = _find_notify_pid()
-
-    if pid is None:
+    if not pids:
         print("  Notify listener not running")
         return
 
-    try:
-        os.kill(pid, signal.SIGTERM)
-        for _ in range(10):
-            time.sleep(0.5)
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
-                break
-        else:
-            os.kill(pid, signal.SIGKILL)
-        print(f"  Stopped notify listener (PID {pid})")
-    except ProcessLookupError:
-        print("  Notify listener already stopped")
+    for pid in sorted(pids):
+        try:
+            os.kill(pid, signal.SIGTERM)
+            for _ in range(10):
+                time.sleep(0.5)
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    break
+            else:
+                os.kill(pid, signal.SIGKILL)
+            print(f"  Stopped notify listener (PID {pid})")
+        except ProcessLookupError:
+            print(f"  Notify listener already stopped (PID {pid})")
 
     pid_file.unlink(missing_ok=True)
     meta_file.unlink(missing_ok=True)
