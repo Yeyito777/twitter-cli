@@ -22,7 +22,6 @@ CONFIG_FILE = CONFIG_DIR / "notify.json"
 STATE_FILE = CONFIG_DIR / "notify-state.json"
 LISTENER_DIR = Path("/tmp/twitter-listeners")
 LOCK_FILE = LISTENER_DIR / "__notify__.lock"
-EXO_REPO_ROOT = PROJECT_ROOT.parents[1]
 
 DEFAULT_POLL_SECONDS = 300
 DEFAULT_MAX_PARENT_REPLIES = 10  # exclusive upper bound: relay when parent replies < 10
@@ -484,7 +483,6 @@ class TwitterNotifyService:
                     capture_output=True,
                     text=True,
                     timeout=660,
-                    cwd=str(EXO_REPO_ROOT),
                 )
                 if result.returncode != 0:
                     failed.append(conv_id)
