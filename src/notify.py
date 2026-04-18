@@ -13,6 +13,7 @@ from pathlib import Path
 
 from src.api import graphql_get, rest_get
 from src.auth import PROJECT_ROOT
+from src.exocortex import manage_external_tool_daemon
 from src.format import format_tweet
 from src.helpers import Q, parse_tweet_ref
 from src.parse import parse_timeline_entries, parse_tweet
@@ -687,56 +688,8 @@ def start(argv):
         description="Start the Twitter notification relay listener.")
     p.parse_args(argv)
 
-    cfg = _load_config()
-    targets = cfg.get("relay_targets", [])
-    if not targets:
-        print("  No relay targets configured. Run: twitter notify add <conv_id>")
-        return
-
-    LISTENER_DIR.mkdir(parents=True, exist_ok=True)
-    paths = _listener_paths()
-    pid_file = paths["pid"]
-    log_file = paths["log"]
-    err_file = paths["err"]
-    meta_file = paths["meta"]
-
-    existing_pids = _find_notify_pids()
-    if existing_pids:
-        print(
-            f"  Found {len(existing_pids)} existing notify listener"
-            f"{'s' if len(existing_pids) != 1 else ''}; restarting cleanly"
-        )
-        print(f"  Existing PIDs: {', '.join(str(pid) for pid in existing_pids)}")
-        _stop_notify_pids(existing_pids)
-
-    pid_file.unlink(missing_ok=True)
-
-    env = os.environ.copy()
-    env["PYTHONPATH"] = str(PROJECT_ROOT)
-
-    proc = subprocess.Popen(
-        [sys.executable, "-m", "src.notify", "__run__", str(log_file)],
-        cwd=str(PROJECT_ROOT),
-        env=env,
-        start_new_session=True,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=open(err_file, "a"),
-    )
-
-    pid_file.write_text(str(proc.pid))
-    meta = {
-        "type": "notify",
-        "relay_targets": targets,
-        "poll_seconds": cfg.get("poll_seconds", DEFAULT_POLL_SECONDS),
-        "max_parent_replies": cfg.get("max_parent_replies", DEFAULT_MAX_PARENT_REPLIES),
-        "started": time.strftime("%Y-%m-%dT%H:%M:%S"),
-    }
-    meta_file.write_text(json.dumps(meta, indent=2) + "\n")
-
-    print(f"  Notify listener started (PID {proc.pid})")
-    print(f"  Relaying to: {', '.join(targets)}")
-    print(f"  Output: {log_file}")
+    status = manage_external_tool_daemon("twitter", "start")
+    print(f"  {status.get('message', 'Requested start for supervised Twitter daemon')}")
 
 
 def stop(argv):
@@ -744,27 +697,8 @@ def stop(argv):
         description="Stop the Twitter notification relay listener.")
     p.parse_args(argv)
 
-    paths = _listener_paths()
-    pid_file = paths["pid"]
-    meta_file = paths["meta"]
-
-    pids = set(_find_notify_pids())
-    if pid_file.exists():
-        try:
-            candidate = int(pid_file.read_text().strip())
-            os.kill(candidate, 0)
-            pids.add(candidate)
-        except (ProcessLookupError, ValueError):
-            pid_file.unlink(missing_ok=True)
-
-    if not pids:
-        print("  Notify listener not running")
-        return
-
-    _stop_notify_pids(pids)
-
-    pid_file.unlink(missing_ok=True)
-    meta_file.unlink(missing_ok=True)
+    status = manage_external_tool_daemon("twitter", "stop")
+    print(f"  {status.get('message', 'Requested stop for supervised Twitter daemon')}")
 
 
 def _run_daemon(argv):
