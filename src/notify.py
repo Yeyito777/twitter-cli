@@ -480,7 +480,7 @@ class TwitterNotifyService:
         for conv_id in targets:
             try:
                 result = subprocess.run(
-                    ["exo", "send", msg, "-c", conv_id, "--timeout", "600"],
+                    ["exo", "send", msg, "-c", conv_id, "--timeout", "600", "--no-notify"],
                     capture_output=True,
                     text=True,
                     timeout=660,
