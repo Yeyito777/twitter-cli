@@ -4,6 +4,7 @@ import argparse
 import sys
 
 from src.api import graphql_post
+from src.agent_tweets import record_agent_tweet, unrecord_agent_tweet
 from src.parse import parse_tweet
 from src.format import format_tweet
 from src.helpers import Q, require_tweet_ref
@@ -29,8 +30,12 @@ def post(argv):
         "semantic_annotation_ids": [],
     }
 
+    reply_to_id = None
+    quote_id = None
+
     if args.reply:
         tweet_id = require_tweet_ref(args.reply)
+        reply_to_id = tweet_id
         variables["reply"] = {
             "in_reply_to_tweet_id": tweet_id,
             "exclude_reply_user_ids": [],
@@ -38,6 +43,7 @@ def post(argv):
 
     if args.quote:
         tweet_id = require_tweet_ref(args.quote)
+        quote_id = tweet_id
         variables["attachment_url"] = f"https://x.com/i/status/{tweet_id}"
 
     data = graphql_post(Q["CreateTweet"], "CreateTweet", variables)
@@ -58,6 +64,14 @@ def post(argv):
         sys.exit(1)
 
     if parsed:
+        record_agent_tweet(
+            parsed.get("id"),
+            text=parsed.get("text", text),
+            command="reply" if reply_to_id else "post",
+            reply_to_id=reply_to_id,
+            quote_id=quote_id,
+            url=parsed.get("url", ""),
+        )
         print("Posted:")
         print(format_tweet(parsed))
     else:
@@ -69,6 +83,13 @@ def post(argv):
             .get("rest_id")
         )
         if fallback_id:
+            record_agent_tweet(
+                fallback_id,
+                text=text,
+                command="reply" if reply_to_id else "post",
+                reply_to_id=reply_to_id,
+                quote_id=quote_id,
+            )
             print(f"Posted. Tweet ID: {fallback_id}")
         else:
             print("Posted.")
@@ -96,4 +117,5 @@ def delete(argv):
         Q["DeleteTweet"], "DeleteTweet",
         {"tweet_id": tweet_id, "dark_request": False},
     )
+    unrecord_agent_tweet(tweet_id)
     print("Deleted.")

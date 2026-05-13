@@ -12,6 +12,7 @@ import traceback
 from pathlib import Path
 
 from src.api import graphql_get, rest_get
+from src.agent_tweets import is_agent_tweet, list_agent_tweets, record_agent_tweet, unrecord_agent_tweet
 from src.auth import PROJECT_ROOT
 from src.exocortex import manage_external_tool_daemon
 from src.format import format_tweet
@@ -358,6 +359,12 @@ class TwitterNotifyService:
         if tweet.get("is_reply") and tweet.get("in_reply_to_id"):
             parent = self._fetch_tweet(tweet.get("in_reply_to_id"))
             if parent and parent.get("handle", "").lower() == self.self_handle:
+                if not is_agent_tweet(parent.get("id")):
+                    self._log(
+                        f"Skip @{tweet['handle']} reply {tweet['id']}: "
+                        f"parent {parent.get('id')} is not agent-managed"
+                    )
+                    return None
                 parent_replies = int(parent.get("replies", 0) or 0)
                 if parent_replies < self.max_parent_replies:
                     thread_items = self._fetch_thread_items(tweet["id"])
@@ -382,6 +389,12 @@ class TwitterNotifyService:
         if tweet.get("is_quote") and tweet.get("quoted"):
             quoted = tweet.get("quoted")
             if quoted and quoted.get("handle", "").lower() == self.self_handle:
+                if not is_agent_tweet(quoted.get("id")):
+                    self._log(
+                        f"Skip @{tweet['handle']} quote {tweet['id']}: "
+                        f"quoted tweet {quoted.get('id')} is not agent-managed"
+                    )
+                    return None
                 return self._build_event(
                     "quote_tweet",
                     source,
@@ -679,14 +692,73 @@ def list_config(argv):
         if len(pids) > 1:
             print("  Warning: multiple notify listeners detected")
     print(f"  Pending relays: {len(state.get('pending_events', {}))}")
+    managed_ids, _details = list_agent_tweets()
+    print(f"  Agent-managed tweets: {len(managed_ids)}")
     if state.get("last_poll"):
         print(f"  Last poll: {state['last_poll']}")
+
+
+def mark(argv):
+    p = argparse.ArgumentParser(prog="twitter notify mark",
+        description="Mark one of your tweets as agent-managed so replies/quotes are relayed.")
+    p.add_argument("tweet", help="Tweet ID or URL")
+    args = p.parse_args(argv)
+
+    tweet_id = parse_tweet_ref(args.tweet)
+    if not tweet_id:
+        print("  Invalid tweet ID/URL", file=sys.stderr)
+        sys.exit(1)
+    record_agent_tweet(tweet_id, command="manual-mark")
+    print(f"  Marked agent-managed tweet: {tweet_id}")
+
+
+def unmark(argv):
+    p = argparse.ArgumentParser(prog="twitter notify unmark",
+        description="Remove a tweet from the agent-managed relay allowlist.")
+    p.add_argument("tweet", help="Tweet ID or URL")
+    args = p.parse_args(argv)
+
+    tweet_id = parse_tweet_ref(args.tweet)
+    if not tweet_id:
+        print("  Invalid tweet ID/URL", file=sys.stderr)
+        sys.exit(1)
+    if unrecord_agent_tweet(tweet_id):
+        print(f"  Unmarked agent-managed tweet: {tweet_id}")
+    else:
+        print(f"  Not marked: {tweet_id}")
+
+
+def managed(argv):
+    p = argparse.ArgumentParser(prog="twitter notify managed",
+        description="List tweets whose replies/quotes can be relayed.")
+    p.add_argument("-n", "--count", type=int, default=50, help="Number of tweets to show")
+    args = p.parse_args(argv)
+
+    ids, details = list_agent_tweets()
+    if not ids:
+        print("  No agent-managed tweets recorded")
+        return
+    for tweet_id in ids[-max(1, args.count):]:
+        entry = details.get(tweet_id, {})
+        command = entry.get("command", "?")
+        text = (entry.get("text") or "").replace("\n", " ")[:100]
+        suffix = f" — {text}" if text else ""
+        print(f"  {tweet_id} [{command}]{suffix}")
 
 
 def start(argv):
     p = argparse.ArgumentParser(prog="twitter notify start",
         description="Start the Twitter notification relay listener.")
     p.parse_args(argv)
+
+    existing_pids = _find_notify_pids()
+    if existing_pids:
+        print(
+            f"  Found {len(existing_pids)} existing notify listener"
+            f"{'s' if len(existing_pids) != 1 else ''}; restarting cleanly"
+        )
+        print(f"  Existing PIDs: {', '.join(str(pid) for pid in existing_pids)}")
+        _stop_notify_pids(existing_pids)
 
     status = manage_external_tool_daemon("twitter", "start")
     print(f"  {status.get('message', 'Requested start for supervised Twitter daemon')}")
@@ -699,6 +771,10 @@ def stop(argv):
 
     status = manage_external_tool_daemon("twitter", "stop")
     print(f"  {status.get('message', 'Requested stop for supervised Twitter daemon')}")
+
+    existing_pids = _find_notify_pids()
+    if existing_pids:
+        _stop_notify_pids(existing_pids)
 
 
 def _run_daemon(argv):
@@ -714,6 +790,9 @@ _COMMANDS = {
     "add": add,
     "remove": remove,
     "list": list_config,
+    "mark": mark,
+    "unmark": unmark,
+    "managed": managed,
     "start": start,
     "stop": stop,
 }
