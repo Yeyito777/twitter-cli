@@ -38,7 +38,8 @@ def parse_tweet(result):
     # Tweet metadata
     tweet_id = result.get("rest_id", "")
     created_at = _parse_date(legacy.get("created_at", ""))
-    full_text = legacy.get("full_text", "")
+    note_tweet = result.get("note_tweet", {}).get("note_tweet_results", {}).get("result", {})
+    full_text = note_tweet.get("text") or legacy.get("full_text", "")
     lang = legacy.get("lang", "")
 
     # Engagement
