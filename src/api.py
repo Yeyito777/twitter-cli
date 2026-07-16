@@ -112,7 +112,14 @@ def _build_headers(tokens, method="GET", path=None):
         ),
     }
     if path:
-        headers["x-client-transaction-id"] = _generate_txid(method, path)
+        try:
+            headers["x-client-transaction-id"] = _generate_txid(method, path)
+        except Exception:
+            # X periodically changes its frontend ondemand JS discovery. The
+            # authenticated API often still accepts requests without this
+            # browser-only anti-abuse header, so fail open rather than breaking
+            # all read/curation commands.
+            pass
     return headers
 
 
