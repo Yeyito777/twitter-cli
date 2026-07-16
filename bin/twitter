@@ -45,7 +45,8 @@ commands:
     logout               Remove stored credentials
 
   Notify:
-    notify               Manage reply/quote relay into exo conversations
+    notify               Manage Exocortex reply/quote subscriptions
+                         (subscribe, unsubscribe, list, mark, start, stop)
 
 Run 'twitter <command> --help' for command-specific usage.
 EOF

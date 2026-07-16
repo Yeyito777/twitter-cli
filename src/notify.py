@@ -1,4 +1,4 @@
-"""Notify subcommands — manage Twitter reply/quote relay."""
+"""Manage Twitter reply/quote publications and Exocortex subscriptions."""
 
 import argparse
 import fcntl
@@ -14,7 +14,14 @@ from pathlib import Path
 from src.api import graphql_get, rest_get
 from src.agent_tweets import is_agent_tweet, list_agent_tweets, record_agent_tweet, unrecord_agent_tweet
 from src.auth import PROJECT_ROOT
-from src.exocortex import manage_external_tool_daemon
+from src.exocortex import (
+    list_external_notification_subscriptions,
+    manage_external_tool_daemon,
+    publish_external_notification,
+    register_external_notification_source,
+    subscribe_external_notification,
+    unsubscribe_external_notification,
+)
 from src.format import format_tweet
 from src.helpers import Q, parse_tweet_ref
 from src.parse import parse_timeline_entries, parse_tweet
@@ -31,6 +38,10 @@ DEFAULT_FETCH_COUNT = 50
 MAX_SEEN_IDS = 1000
 MAX_RELAYED_IDS = 1000
 MAX_PENDING_EVENTS = 200
+
+TOOL_NAME = "twitter"
+NOTIFICATION_SOURCE_ID = "managed-tweet-replies"
+NOTIFICATION_SOURCE_LABEL = "Replies and quotes to agent-managed tweets"
 
 
 def _read_json_file(path, default=None):
@@ -56,16 +67,22 @@ def _listener_paths():
 def _load_config():
     cfg = _read_json_file(CONFIG_FILE)
 
-    return {
-        "relay_targets": list(cfg.get("relay_targets", [])),
+    normalized = {
         "poll_seconds": int(cfg.get("poll_seconds", DEFAULT_POLL_SECONDS)),
         "max_parent_replies": int(cfg.get("max_parent_replies", DEFAULT_MAX_PARENT_REPLIES)),
     }
+    # Kept only until daemon-start migration has successfully imported every
+    # legacy target into the core subscription registry.
+    if "relay_targets" in cfg:
+        normalized["relay_targets"] = list(cfg.get("relay_targets") or [])
+    return normalized
 
 
 def _save_config(cfg):
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    CONFIG_FILE.write_text(json.dumps(cfg, indent=2) + "\n")
+    tmp_file = CONFIG_FILE.with_suffix(".tmp")
+    tmp_file.write_text(json.dumps(cfg, indent=2) + "\n")
+    tmp_file.replace(CONFIG_FILE)
 
 
 def _dedupe_tail(items, limit):
@@ -128,7 +145,52 @@ def _save_state(state):
 
 
 def get_relay_targets():
+    """Return not-yet-migrated legacy relay targets."""
     return _load_config().get("relay_targets", [])
+
+
+def _migrate_legacy_relay_targets():
+    """Import old config routes exactly once, removing them only on success."""
+    cfg = _read_json_file(CONFIG_FILE)
+    if "relay_targets" not in cfg:
+        return 0
+
+    targets = _dedupe_tail(
+        [str(target) for target in (cfg.get("relay_targets") or []) if target],
+        MAX_RELAYED_IDS,
+    )
+    subscriptions = list_external_notification_subscriptions(
+        tool_name=TOOL_NAME,
+        source_id=NOTIFICATION_SOURCE_ID,
+    )
+    existing_conv_ids = {
+        str(subscription.get("convId"))
+        for subscription in subscriptions
+        if subscription.get("convId")
+    }
+
+    # subscribe_external_notification is an upsert in core, while the list
+    # check also preserves an existing route's chosen delivery mode.
+    for conv_id in targets:
+        if conv_id in existing_conv_ids:
+            continue
+        subscribe_external_notification(
+            TOOL_NAME,
+            NOTIFICATION_SOURCE_ID,
+            conv_id,
+            delivery="wake",
+            source_label=NOTIFICATION_SOURCE_LABEL,
+        )
+
+    # Re-read before writing so unrelated poll/filter edits made during IPC
+    # calls are retained. A newly changed legacy list is left for the next
+    # startup rather than accidentally marking it migrated.
+    latest = _read_json_file(CONFIG_FILE)
+    if latest.get("relay_targets") != cfg.get("relay_targets"):
+        raise RuntimeError("notify.json relay_targets changed during migration")
+    latest.pop("relay_targets", None)
+    _save_config(latest)
+    return len(targets)
 
 
 def _find_notify_pids():
@@ -173,9 +235,8 @@ def _stop_notify_pids(pids, *, verbose=True):
 
 
 class TwitterNotifyService:
-    def __init__(self, log_file, relay_targets=None):
+    def __init__(self, log_file):
         self.log_file = Path(log_file)
-        self.relay_targets = list(relay_targets or [])
         self.running = True
         self.cfg = _load_config()
         self.poll_seconds = max(30, int(self.cfg.get("poll_seconds", DEFAULT_POLL_SECONDS)))
@@ -483,77 +544,56 @@ class TwitterNotifyService:
     def _indent(self, text, prefix="  "):
         return "\n".join(prefix + line if line else prefix.rstrip() for line in text.splitlines())
 
-    def _relay_event(self, event, relay_targets=None):
+    def _publish_event(self, event):
         msg = self._format_event_message(event)
         incoming_id = event["incoming_tweet"]["id"]
-        success = []
-        failed = []
-        targets = list(relay_targets or self.relay_targets)
-
-        for conv_id in targets:
-            try:
-                result = subprocess.run(
-                    ["exo", "send", msg, "-c", conv_id, "--timeout", "600", "--no-notify"],
-                    capture_output=True,
-                    text=True,
-                    timeout=660,
-                )
-                if result.returncode != 0:
-                    failed.append(conv_id)
-                    self._log(
-                        f"Relay failed for tweet {incoming_id} to {conv_id}: "
-                        f"{result.stderr.strip()[:300]}"
-                    )
-                else:
-                    success.append(conv_id)
-                    out = (result.stdout or "").strip()
-                    if "queued" in out.lower():
-                        self._log(f"Relayed tweet {incoming_id} to {conv_id}: auto-queued")
-                    else:
-                        self._log(f"Relayed tweet {incoming_id} to {conv_id}: delivered")
-            except subprocess.TimeoutExpired:
-                failed.append(conv_id)
-                self._log(f"Relay timed out for tweet {incoming_id} to {conv_id}")
-            except Exception as e:
-                failed.append(conv_id)
-                self._log(f"Relay error for tweet {incoming_id} to {conv_id}: {e}")
-
-        return success, failed
-
-    def _pending_targets_for(self, incoming_id):
-        relay_map = self.state.setdefault("relayed_by_target", {})
-        pending = []
-        for conv_id in self.relay_targets:
-            delivered = set(relay_map.get(conv_id, []))
-            if incoming_id not in delivered:
-                pending.append(conv_id)
-        return pending
-
-    def _mark_delivery_success(self, incoming_id, success_targets):
-        relay_map = self.state.setdefault("relayed_by_target", {})
-        for conv_id in success_targets:
-            delivered = relay_map.setdefault(conv_id, [])
-            delivered.append(incoming_id)
+        result = publish_external_notification(
+            TOOL_NAME,
+            NOTIFICATION_SOURCE_ID,
+            incoming_id,
+            msg,
+        )
+        deliveries = list(result.get("deliveries") or [])
+        status_counts = {}
+        for delivery in deliveries:
+            status = delivery.get("status", "unknown")
+            status_counts[status] = status_counts.get(status, 0) + 1
+        summary = ", ".join(
+            f"{count} {status}" for status, count in sorted(status_counts.items())
+        ) or "no subscribers"
+        self._log(f"Published tweet {incoming_id} to Exocortex core: {summary}")
+        return result
 
     def _mark_fully_relayed(self, incoming_id):
         self.state.setdefault("relayed_tweet_ids", []).append(incoming_id)
         self.state.setdefault("pending_events", {}).pop(incoming_id, None)
 
-    def _attempt_event_relay(self, event):
+    def _attempt_event_publish(self, event):
         incoming_id = event["incoming_tweet"].get("id")
         if not incoming_id:
             return False
 
-        pending_targets = self._pending_targets_for(incoming_id)
-        if not pending_targets:
-            self._mark_fully_relayed(incoming_id)
+        if incoming_id in set(self.state.get("relayed_tweet_ids", [])):
+            self.state.setdefault("pending_events", {}).pop(incoming_id, None)
             return False
 
-        success_targets, failed_targets = self._relay_event(event, pending_targets)
-        if success_targets:
-            self._mark_delivery_success(incoming_id, success_targets)
+        try:
+            result = self._publish_event(event)
+        except Exception as e:
+            self._log(f"Publish error for tweet {incoming_id}: {e}")
+            self.state.setdefault("pending_events", {})[incoming_id] = event
+            return False
 
-        if failed_targets:
+        failed_deliveries = [
+            delivery
+            for delivery in (result.get("deliveries") or [])
+            if delivery.get("status") == "failed"
+        ]
+        if failed_deliveries:
+            self._log(
+                f"Publish for tweet {incoming_id} had {len(failed_deliveries)} failed "
+                "delivery target(s); retaining for retry"
+            )
             self.state.setdefault("pending_events", {})[incoming_id] = event
             return False
 
@@ -579,7 +619,7 @@ class TwitterNotifyService:
 
         pending_events = dict(self.state.get("pending_events", {}))
         for incoming_id, event in pending_events.items():
-            if self._attempt_event_relay(event):
+            if self._attempt_event_publish(event):
                 relayed += 1
 
         for entry in reversed(new_entries):
@@ -589,7 +629,7 @@ class TwitterNotifyService:
             incoming_id = event["incoming_tweet"].get("id")
             if not incoming_id:
                 continue
-            if self._attempt_event_relay(event):
+            if self._attempt_event_publish(event):
                 relayed += 1
 
         self.state.setdefault("seen_entry_ids", []).extend(entry_ids)
@@ -606,12 +646,22 @@ class TwitterNotifyService:
         if not self._acquire_lock():
             return
 
-        self._log(
-            f"Notify service starting for @{self.self_handle} with "
-            f"poll={self.poll_seconds}s threshold=<{self.max_parent_replies} replies "
-            f"targets={','.join(self.relay_targets) or '(none)'}"
-        )
         try:
+            register_external_notification_source(
+                TOOL_NAME,
+                NOTIFICATION_SOURCE_ID,
+                NOTIFICATION_SOURCE_LABEL,
+            )
+            migrated = _migrate_legacy_relay_targets()
+            if migrated:
+                self._log(
+                    f"Migrated {migrated} legacy relay target"
+                    f"{'s' if migrated != 1 else ''} to Exocortex subscriptions"
+                )
+            self._log(
+                f"Notify service starting for @{self.self_handle} with "
+                f"poll={self.poll_seconds}s threshold=<{self.max_parent_replies} replies"
+            )
             while self.running:
                 try:
                     stats = self.poll_once()
@@ -620,7 +670,7 @@ class TwitterNotifyService:
                     elif stats["new_entries"] or stats["relayed"] or stats["pending"]:
                         self._log(
                             f"Poll complete: {stats['new_entries']} new notification entries, "
-                            f"{stats['relayed']} fully relayed, {stats['pending']} pending"
+                            f"{stats['relayed']} published, {stats['pending']} pending"
                         )
                 except Exception as e:
                     self._log(f"Poll error: {e}")
@@ -633,56 +683,93 @@ class TwitterNotifyService:
             self._log("Notify service stopped")
 
 
+def _subscribe(argv, *, prog):
+    p = argparse.ArgumentParser(
+        prog=prog,
+        description="Subscribe an Exocortex conversation to managed-tweet replies and quotes.",
+    )
+    p.add_argument("conv_id", help="Exo conversation ID")
+    p.add_argument(
+        "--delivery",
+        choices=("wake", "inbox"),
+        default="wake",
+        help="wake starts/queues an agent turn; inbox stores without waking (default: wake)",
+    )
+    args = p.parse_args(argv)
+
+    subscription = subscribe_external_notification(
+        TOOL_NAME,
+        NOTIFICATION_SOURCE_ID,
+        args.conv_id,
+        delivery=args.delivery,
+        source_label=NOTIFICATION_SOURCE_LABEL,
+    )
+    delivery = subscription.get("delivery", args.delivery)
+    print(f"  Subscribed: {args.conv_id} ({delivery})")
+
+
+def subscribe(argv):
+    _subscribe(argv, prog="twitter notify subscribe")
+
+
 def add(argv):
-    p = argparse.ArgumentParser(prog="twitter notify add",
-        description="Add an exo conversation as a relay target.")
+    """Backward-compatible alias for subscribe."""
+    _subscribe(argv, prog="twitter notify add")
+
+
+def _unsubscribe(argv, *, prog):
+    p = argparse.ArgumentParser(
+        prog=prog,
+        description="Unsubscribe an Exocortex conversation from Twitter notifications.",
+    )
     p.add_argument("conv_id", help="Exo conversation ID")
     args = p.parse_args(argv)
 
-    cfg = _load_config()
-    targets = cfg.setdefault("relay_targets", [])
-    if args.conv_id in targets:
-        print(f"  Already added: {args.conv_id}")
-        return
-    targets.append(args.conv_id)
-    _save_config(cfg)
-    print(f"  Added relay target: {args.conv_id}")
-    print("  Restart notify listener for changes to take effect.")
+    unsubscribe_external_notification(
+        tool_name=TOOL_NAME,
+        source_id=NOTIFICATION_SOURCE_ID,
+        conv_id=args.conv_id,
+    )
+    print(f"  Unsubscribed: {args.conv_id}")
+
+
+def unsubscribe(argv):
+    _unsubscribe(argv, prog="twitter notify unsubscribe")
 
 
 def remove(argv):
-    p = argparse.ArgumentParser(prog="twitter notify remove",
-        description="Remove a relay target.")
-    p.add_argument("conv_id", help="Exo conversation ID")
-    args = p.parse_args(argv)
-
-    cfg = _load_config()
-    targets = cfg.get("relay_targets", [])
-    if args.conv_id not in targets:
-        print(f"  Not found: {args.conv_id}")
-        return
-    targets.remove(args.conv_id)
-    _save_config(cfg)
-    print(f"  Removed relay target: {args.conv_id}")
-    print("  Restart notify listener for changes to take effect.")
+    """Backward-compatible alias for unsubscribe."""
+    _unsubscribe(argv, prog="twitter notify remove")
 
 
 def list_config(argv):
     p = argparse.ArgumentParser(prog="twitter notify list",
-        description="Show notification relay configuration.")
+        description="Show Exocortex subscriptions and Twitter polling configuration.")
     p.parse_args(argv)
 
     cfg = _load_config()
     state = _load_state()
     pids = _find_notify_pids()
+    subscriptions = list_external_notification_subscriptions(
+        tool_name=TOOL_NAME,
+        source_id=NOTIFICATION_SOURCE_ID,
+    )
 
-    print("  Relay targets:")
-    targets = cfg.get("relay_targets", [])
-    if targets:
-        for t in targets:
-            print(f"    • {t}")
+    print("  Subscriptions:")
+    if subscriptions:
+        for subscription in subscriptions:
+            conv_id = subscription.get("convId", "?")
+            delivery = subscription.get("delivery", "wake")
+            enabled = "enabled" if subscription.get("enabled", True) else "disabled"
+            subscription_id = subscription.get("id")
+            suffix = f" [{subscription_id}]" if subscription_id else ""
+            print(f"    • {conv_id} ({delivery}, {enabled}){suffix}")
     else:
         print("    (none)")
+
+    legacy_targets = cfg.get("relay_targets", [])
+    if legacy_targets:
+        print(f"  Legacy targets awaiting daemon migration: {len(legacy_targets)}")
 
     print(f"  Poll interval: {cfg.get('poll_seconds', DEFAULT_POLL_SECONDS)}s")
     print(f"  Parent reply threshold: <{cfg.get('max_parent_replies', DEFAULT_MAX_PARENT_REPLIES)} replies")
@@ -691,7 +778,7 @@ def list_config(argv):
         print(f"  PIDs: {', '.join(str(pid) for pid in pids)}")
         if len(pids) > 1:
             print("  Warning: multiple notify listeners detected")
-    print(f"  Pending relays: {len(state.get('pending_events', {}))}")
+    print(f"  Pending publications: {len(state.get('pending_events', {}))}")
     managed_ids, _details = list_agent_tweets()
     print(f"  Agent-managed tweets: {len(managed_ids)}")
     if state.get("last_poll"):
@@ -748,7 +835,7 @@ def managed(argv):
 
 def start(argv):
     p = argparse.ArgumentParser(prog="twitter notify start",
-        description="Start the Twitter notification relay listener.")
+        description="Start the supervised Twitter notification poller.")
     p.parse_args(argv)
 
     existing_pids = _find_notify_pids()
@@ -766,7 +853,7 @@ def start(argv):
 
 def stop(argv):
     p = argparse.ArgumentParser(prog="twitter notify stop",
-        description="Stop the Twitter notification relay listener.")
+        description="Stop the supervised Twitter notification poller.")
     p.parse_args(argv)
 
     status = manage_external_tool_daemon("twitter", "stop")
@@ -778,15 +865,40 @@ def stop(argv):
 
 
 def _run_daemon(argv):
-    if not argv:
-        raise SystemExit("usage: python -m src.notify __run__ <log_file> [conv_id ...]")
+    if len(argv) != 1:
+        raise SystemExit("usage: python -m src.notify __run__ <log_file>")
     log_file = argv[0]
-    relay_targets = argv[1:] or _load_config().get("relay_targets", [])
-    service = TwitterNotifyService(log_file, relay_targets=relay_targets)
+    service = TwitterNotifyService(log_file)
     service.run()
 
 
+def help_command(argv):
+    p = argparse.ArgumentParser(
+        prog="twitter notify",
+        description=(
+            "Publish replies and quotes to agent-managed tweets through "
+            "Exocortex's notification registry."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""commands:
+  subscribe <conv_id>    Subscribe a conversation (--delivery wake|inbox)
+  unsubscribe <conv_id>  Remove that conversation's subscription
+  list                   Show subscriptions, poller status, and delivery state
+  mark <tweet>           Mark a tweet as agent-managed
+  unmark <tweet>         Stop managing a tweet
+  managed                List agent-managed tweets
+  start / stop           Manage the supervised notification poller
+
+aliases:
+  add = subscribe, remove = unsubscribe""",
+    )
+    p.parse_args(argv)
+    p.print_help()
+
+
 _COMMANDS = {
+    "subscribe": subscribe,
+    "unsubscribe": unsubscribe,
     "add": add,
     "remove": remove,
     "list": list_config,
@@ -795,6 +907,7 @@ _COMMANDS = {
     "managed": managed,
     "start": start,
     "stop": stop,
+    "help": help_command,
 }
 
 
@@ -803,7 +916,7 @@ def dispatch(cmd, argv):
         list_config([])
         return
 
-    subcmd = argv[0]
+    subcmd = "help" if argv[0] in ("-h", "--help") else argv[0]
     fn = _COMMANDS.get(subcmd)
     if fn is None:
         print(f"  Unknown notify subcommand: {subcmd}")
