@@ -24,11 +24,11 @@ commands:
     bookmarks, bms       List bookmarked tweets
     trending             Trending topics
     dms                  List DM conversations
-    dm <@user_or_id>     Read/send a DM conversation
+    dm <@user_or_id>     Read a DM, or send exact stdin text with --send
 
   Posting:
-    post <text>          Post a tweet (--reply, --quote)
-    reply <tweet> <text> Reply to a tweet
+    post                 Post exact stdin text (--reply, --quote)
+    reply <tweet>        Reply using exact stdin text
     delete <id_or_url>   Delete one of your own tweets
 
   Engagement:
@@ -47,6 +47,10 @@ commands:
   Notify:
     notify               Manage Exocortex reply/quote subscriptions
                          (subscribe, unsubscribe, list, mark, start, stop)
+
+Payload input:
+  post, reply, and dm --send read exact UTF-8 text from stdin.
+  Inline message arguments are not accepted.
 
 Run 'twitter <command> --help' for command-specific usage.
 EOF

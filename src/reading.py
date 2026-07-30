@@ -10,6 +10,7 @@ from src.helpers import (
     Q, DM_PARAMS, require_tweet_ref, compact_num, resolve_user_id,
     format_dm_time,
 )
+from src.payload import read_stdin_text, reject_inline_text
 
 
 def timeline(argv):
@@ -445,14 +446,29 @@ def dms(argv):
 
 def dm(argv):
     """Read or send a DM in a conversation."""
-    p = argparse.ArgumentParser(prog="twitter dm")
+    p = argparse.ArgumentParser(
+        prog="twitter dm",
+        description="Read a DM conversation, or send exact stdin text with --send.",
+        epilog="Inline DM text is not accepted. Stdin is read only when --send is present.",
+    )
     p.add_argument("conversation", help="Conversation ID or @username")
-    p.add_argument("-s", "--send", nargs="+", help="Send a message")
+    p.add_argument("inline_text", nargs="*", help=argparse.SUPPRESS)
+    p.add_argument(
+        "-s",
+        "--send",
+        action="store_true",
+        help="Send a DM using text read exactly from stdin",
+    )
     args = p.parse_args(argv)
 
-    # If --send is provided, send a message
+    if args.inline_text:
+        if args.send:
+            reject_inline_text(p, args.inline_text, label="DM text")
+        p.error("to send DM text, use --send and provide the text via stdin")
+
     if args.send:
-        _dm_send(args)
+        text = read_stdin_text(p, label="DM text")
+        _dm_send(args.conversation, text)
         return
 
     # Otherwise, read the conversation
@@ -506,12 +522,11 @@ def _resolve_dm_conv_id(ref):
     sys.exit(1)
 
 
-def _dm_send(args):
+def _dm_send(conversation, text):
     """Send a DM."""
     from src.api import rest_post
 
-    conv_id = args.conversation
-    text = " ".join(args.send)
+    conv_id = conversation
 
     # If a @username is given, resolve to conversation ID
     if not conv_id.replace("-", "").isdigit():

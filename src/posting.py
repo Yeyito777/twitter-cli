@@ -8,20 +8,28 @@ from src.agent_tweets import record_agent_tweet, unrecord_agent_tweet
 from src.parse import parse_tweet
 from src.format import format_tweet
 from src.helpers import Q, require_tweet_ref
+from src.payload import read_stdin_text, reject_inline_text
 
 
 def post(argv):
     """Post a new tweet, optionally as a reply or quote."""
-    p = argparse.ArgumentParser(prog="twitter post")
-    p.add_argument("text", nargs="+", help="Tweet text")
+    p = argparse.ArgumentParser(
+        prog="twitter post",
+        description="Post a tweet using text read exactly from stdin.",
+        epilog="Inline tweet text is not accepted; stdin is required.",
+    )
+    p.add_argument("inline_text", nargs="*", help=argparse.SUPPRESS)
     p.add_argument("-r", "--reply", type=str, help="Tweet ID/URL to reply to")
     p.add_argument("-q", "--quote", type=str, help="Tweet ID/URL to quote")
     args = p.parse_args(argv)
 
-    text = " ".join(args.text)
-    if not text:
-        print("Error: tweet text is required.", file=sys.stderr)
-        sys.exit(1)
+    reject_inline_text(p, args.inline_text, label="tweet text")
+    text = read_stdin_text(p, label="tweet text")
+    _post_text(text, reply=args.reply, quote=args.quote)
+
+
+def _post_text(text, *, reply=None, quote=None):
+    """Post already-decoded exact text with optional reply/quote metadata."""
 
     variables = {
         "tweet_text": text,
@@ -33,16 +41,16 @@ def post(argv):
     reply_to_id = None
     quote_id = None
 
-    if args.reply:
-        tweet_id = require_tweet_ref(args.reply)
+    if reply:
+        tweet_id = require_tweet_ref(reply)
         reply_to_id = tweet_id
         variables["reply"] = {
             "in_reply_to_tweet_id": tweet_id,
             "exclude_reply_user_ids": [],
         }
 
-    if args.quote:
-        tweet_id = require_tweet_ref(args.quote)
+    if quote:
+        tweet_id = require_tweet_ref(quote)
         quote_id = tweet_id
         variables["attachment_url"] = f"https://x.com/i/status/{tweet_id}"
 
@@ -96,14 +104,19 @@ def post(argv):
 
 
 def reply(argv):
-    """Reply to a tweet. Convenience wrapper around post."""
-    p = argparse.ArgumentParser(prog="twitter reply")
+    """Reply to a tweet using exact text from stdin."""
+    p = argparse.ArgumentParser(
+        prog="twitter reply",
+        description="Reply to a tweet using text read exactly from stdin.",
+        epilog="Inline reply text is not accepted; stdin is required.",
+    )
     p.add_argument("tweet", help="Tweet ID or URL to reply to")
-    p.add_argument("text", nargs="+", help="Reply text")
+    p.add_argument("inline_text", nargs="*", help=argparse.SUPPRESS)
     args = p.parse_args(argv)
 
-    # Rewrite as a post --reply call
-    post(args.text + ["--reply", args.tweet])
+    reject_inline_text(p, args.inline_text, label="reply text")
+    text = read_stdin_text(p, label="reply text")
+    _post_text(text, reply=args.tweet)
 
 
 def delete(argv):
