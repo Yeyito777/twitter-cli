@@ -32,7 +32,8 @@ Q = {
     "Followers":            "W16HbbxU_8PjA_nE2JCr9g",
     "Following":            "ILoifaG-s7J3wWLd29oMSw",
     "Likes":                "W9r1yWJ5e9mGz6HMDHe8Vg",
-    "NotificationsTimeline":"2yjiL84hBkOVpzJkkix6Mw",
+    # Observed in the authenticated notifications page on 2026-10-01.
+    "NotificationsTimeline":"b0C9GbXfaAlL2F-dkJ4Gdg",
     "Bookmarks":            "VFdMm9iVZxlU6hD86gfW_A",
     "ExplorePage":          "LERJigZ3fJPNFrouClO-RQ",
     "GenericTimelineById":  "JuyfK9IWpMEuu8K37e8N8Q",

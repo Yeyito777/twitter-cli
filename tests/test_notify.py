@@ -9,9 +9,10 @@ from unittest.mock import Mock, patch
 from src import notify
 
 
-def _tweet(tweet_id, handle):
+def _tweet(tweet_id, handle, author_id=""):
     return {
         "id": tweet_id,
+        "author_id": author_id,
         "handle": handle,
         "name": handle.title(),
         "created_at": "2026-07-15 12:00",
@@ -192,6 +193,145 @@ class NotifyPublishTests(unittest.TestCase):
         )
 
 
+class NotifyIdentityTests(unittest.TestCase):
+    def _response(self, viewer_id="123", instructions=None):
+        return {
+            "data": {"viewer_v2": {"user_results": {"result": {
+                "__typename": "User",
+                "rest_id": viewer_id,
+                "notification_timeline": {"timeline": {
+                    "instructions": instructions if instructions is not None else [],
+                }},
+            }}}},
+        }
+
+    def test_constructor_does_not_make_a_network_request(self):
+        with (
+            patch.object(notify, "_load_config", return_value={}),
+            patch.object(notify, "_load_state", return_value={}),
+            patch.object(notify.signal, "signal"),
+            patch.object(notify, "graphql_get") as graphql,
+        ):
+            service = notify.TwitterNotifyService("/unused/notify.log")
+        self.assertIsNone(service.self_id)
+        graphql.assert_not_called()
+
+    def test_notification_response_supplies_identity_before_entries_are_processed(self):
+        service = _bare_service()
+        service.self_id = None
+        service.fetch_count = 50
+        entries = [{"entryId": "entry-1"}]
+        response = self._response(instructions=[
+            {"type": "TimelineAddEntries", "entries": entries},
+        ])
+        with patch.object(notify, "graphql_get", return_value=response) as graphql:
+            self.assertEqual(service._fetch_notification_entries(), entries)
+        self.assertEqual(service.self_id, "123")
+        graphql.assert_called_once_with(
+            notify.Q["NotificationsTimeline"], "NotificationsTimeline",
+            {"timeline_type": "All", "count": 50},
+        )
+
+    def test_invalid_viewer_or_missing_timeline_does_not_advance_state(self):
+        service = _bare_service({"initialized": False})
+        service.self_id = None
+        service.fetch_count = 50
+        missing_timeline = self._response()
+        del missing_timeline["data"]["viewer_v2"]["user_results"]["result"]["notification_timeline"]
+        responses = [
+            {}, self._response(viewer_id=""), self._response(viewer_id="not-an-id"),
+            missing_timeline,
+        ]
+        for response in responses:
+            with (
+                self.subTest(response=response),
+                patch.object(notify, "graphql_get", return_value=response),
+                patch.object(notify, "_save_state") as save,
+                self.assertRaisesRegex(RuntimeError, "NotificationsTimeline"),
+            ):
+                service.poll_once()
+            save.assert_not_called()
+            self.assertFalse(service.state["initialized"])
+            self.assertIsNone(service.self_id)
+
+    def test_identity_is_refreshed_on_each_poll(self):
+        service = _bare_service()
+        service.self_id = "old-account"
+        service.fetch_count = 50
+        with patch.object(notify, "graphql_get", return_value=self._response("456")):
+            service._fetch_notification_entries()
+        self.assertEqual(service.self_id, "456")
+
+    def test_own_tweet_detection_uses_ids_and_fails_closed_without_identity(self):
+        service = _bare_service()
+        service.self_id = "123"
+        self.assertTrue(service._is_own_tweet(_tweet("1", "renamed", "123")))
+        self.assertFalse(service._is_own_tweet(_tweet("1", "same-handle", "456")))
+        self.assertFalse(service._is_own_tweet(_tweet("1", "unknown")))
+        service.self_id = None
+        self.assertFalse(service._is_own_tweet(_tweet("1", "unknown")))
+
+    def test_reply_to_managed_tweet_is_selected_by_parent_author_id(self):
+        service = _bare_service()
+        service.self_id = "123"
+        incoming = _tweet("incoming", "other", "456")
+        incoming.update(is_reply=True, in_reply_to_id="parent")
+        parent = _tweet("parent", "renamed-owner", "123")
+        with (
+            patch.object(service, "_fetch_tweet", return_value=parent),
+            patch.object(service, "_fetch_thread_items", return_value=[]),
+            patch.object(notify, "is_agent_tweet", return_value=True),
+        ):
+            service.max_parent_replies = 10
+            self.assertEqual(service._classify_tweet(incoming)["event_type"], "direct_reply")
+        self.assertIsNone(service._classify_tweet(_tweet("own", "new-handle", "123")))
+
+    def test_quote_to_managed_tweet_is_selected_by_quoted_author_id(self):
+        service = _bare_service()
+        service.self_id = "123"
+        incoming = _tweet("incoming", "other", "456")
+        incoming.update(is_quote=True, quoted=_tweet("parent", "renamed-owner", "123"))
+        with patch.object(notify, "is_agent_tweet", return_value=True):
+            self.assertEqual(service._classify_tweet(incoming)["event_type"], "quote_tweet")
+        incoming["quoted"]["author_id"] = "789"
+        self.assertIsNone(service._classify_tweet(incoming))
+
+
+class NotifyRetryTests(unittest.TestCase):
+    def test_poll_errors_back_off_and_recovery_resets_delay_without_restarting(self):
+        service = _bare_service()
+        service.running = True
+        service.poll_seconds = 300
+        service.max_parent_replies = 10
+        service._acquire_lock = Mock(return_value=True)
+        service._release_lock = Mock()
+        success = {"primed": 0, "new_entries": 0, "relayed": 0, "pending": 0}
+        service.poll_once = Mock(side_effect=[
+            *[RuntimeError("HTTP 404") for _ in range(6)],
+            success, RuntimeError("HTTP 404"),
+        ])
+
+        def sleep(_seconds):
+            if service.poll_once.call_count == 8:
+                service.running = False
+
+        service._sleep = Mock(side_effect=sleep)
+        with (
+            patch.object(notify, "register_external_notification_source"),
+            patch.object(notify, "_migrate_legacy_relay_targets", return_value=0),
+            patch.object(notify.traceback, "format_exc", return_value="trace") as trace,
+        ):
+            service.run()
+
+        self.assertEqual(
+            [call.args[0] for call in service._sleep.call_args_list],
+            [30, 60, 120, 240, 300, 300, 300, 30],
+        )
+        self.assertEqual(trace.call_count, 2)
+        service._log.assert_any_call("Notification polling recovered")
+        service._release_lock.assert_called_once()
+
+
 class NotifyCommandTests(unittest.TestCase):
     def test_add_and_remove_remain_registry_aliases(self):
         subscribe = Mock(return_value={"delivery": "inbox"})
@@ -223,7 +363,6 @@ class NotifyCommandTests(unittest.TestCase):
     def test_daemon_run_registers_source_before_migration(self):
         service = _bare_service()
         service.running = False
-        service.self_handle = "agent"
         service.poll_seconds = 300
         service.max_parent_replies = 10
         service._acquire_lock = Mock(return_value=True)

@@ -74,6 +74,7 @@ def parse_tweet(result):
 
     tweet = {
         "id": tweet_id,
+        "author_id": str(user_result.get("rest_id") or legacy.get("user_id_str") or ""),
         "name": name,
         "handle": handle,
         "text": full_text,

@@ -11,7 +11,7 @@ import time
 import traceback
 from pathlib import Path
 
-from src.api import graphql_get, rest_get
+from src.api import graphql_get
 from src.agent_tweets import is_agent_tweet, list_agent_tweets, record_agent_tweet, unrecord_agent_tweet
 from src.auth import PROJECT_ROOT
 from src.exocortex import (
@@ -245,9 +245,9 @@ class TwitterNotifyService:
         self.state = _load_state()
         self.state.setdefault("relayed_by_target", {})
         self.state.setdefault("pending_events", {})
-        self.self_profile = self._get_self_profile()
-        self.self_handle = self.self_profile.get("screen_name", "").lstrip("@").lower()
-        self.self_name = self.self_profile.get("name", self.self_handle)
+        # Resolve the authenticated viewer from each notification response.
+        # The legacy verify_credentials REST route no longer exists on X.
+        self.self_id = None
         self.lock_handle = None
 
         signal.signal(signal.SIGTERM, self._shutdown)
@@ -314,26 +314,29 @@ class TwitterNotifyService:
         while self.running and time.time() < deadline:
             time.sleep(min(1.0, deadline - time.time()))
 
-    def _get_self_profile(self):
-        data = rest_get("/1.1/account/verify_credentials.json")
-        return {
-            "id": data.get("id_str") or str(data.get("id", "")),
-            "screen_name": data.get("screen_name", ""),
-            "name": data.get("name", ""),
-        }
-
     def _fetch_notification_entries(self):
         variables = {
             "timeline_type": "All",
             "count": self.fetch_count,
         }
         data = graphql_get(Q["NotificationsTimeline"], "NotificationsTimeline", variables)
-        instructions = (
+        viewer = (
             data.get("data", {})
             .get("viewer_v2", {}).get("user_results", {}).get("result", {})
-            .get("notification_timeline", {}).get("timeline", {})
-            .get("instructions", [])
         )
+        viewer_id = str(viewer.get("rest_id") or "")
+        if not viewer_id.isdigit():
+            raise RuntimeError("NotificationsTimeline did not return an authenticated viewer ID")
+        instructions = (
+            viewer.get("notification_timeline", {}).get("timeline", {})
+            .get("instructions")
+        )
+        if not isinstance(instructions, list):
+            raise RuntimeError("NotificationsTimeline did not return timeline instructions")
+
+        if self.self_id != viewer_id:
+            self._log(f"Authenticated notification viewer: X user {viewer_id}")
+        self.self_id = viewer_id
 
         for inst in instructions:
             if inst.get("type") == "TimelineAddEntries":
@@ -411,15 +414,18 @@ class TwitterNotifyService:
             "priority": "high",
         }
 
+    def _is_own_tweet(self, tweet):
+        return bool(self.self_id and tweet and tweet.get("author_id") == self.self_id)
+
     def _classify_tweet(self, tweet, source="tweet_item"):
         if not tweet:
             return None
-        if tweet.get("handle", "").lower() == self.self_handle:
+        if self._is_own_tweet(tweet):
             return None
 
         if tweet.get("is_reply") and tweet.get("in_reply_to_id"):
             parent = self._fetch_tweet(tweet.get("in_reply_to_id"))
-            if parent and parent.get("handle", "").lower() == self.self_handle:
+            if self._is_own_tweet(parent):
                 if not is_agent_tweet(parent.get("id")):
                     self._log(
                         f"Skip @{tweet['handle']} reply {tweet['id']}: "
@@ -449,7 +455,7 @@ class TwitterNotifyService:
 
         if tweet.get("is_quote") and tweet.get("quoted"):
             quoted = tweet.get("quoted")
-            if quoted and quoted.get("handle", "").lower() == self.self_handle:
+            if self._is_own_tweet(quoted):
                 if not is_agent_tweet(quoted.get("id")):
                     self._log(
                         f"Skip @{tweet['handle']} quote {tweet['id']}: "
@@ -659,12 +665,18 @@ class TwitterNotifyService:
                     f"{'s' if migrated != 1 else ''} to Exocortex subscriptions"
                 )
             self._log(
-                f"Notify service starting for @{self.self_handle} with "
+                "Notify service starting with "
                 f"poll={self.poll_seconds}s threshold=<{self.max_parent_replies} replies"
             )
+            retry_delay = 30
+            last_error = None
             while self.running:
                 try:
                     stats = self.poll_once()
+                    if last_error is not None:
+                        self._log("Notification polling recovered")
+                    last_error = None
+                    retry_delay = 30
                     if stats["primed"]:
                         pass
                     elif stats["new_entries"] or stats["relayed"] or stats["pending"]:
@@ -673,9 +685,15 @@ class TwitterNotifyService:
                             f"{stats['relayed']} published, {stats['pending']} pending"
                         )
                 except Exception as e:
-                    self._log(f"Poll error: {e}")
-                    self._log(traceback.format_exc().rstrip())
-                    self._sleep(30)
+                    error = (type(e).__name__, str(e))
+                    self._log(f"Poll error: {e}; retrying in {retry_delay}s")
+                    if error != last_error:
+                        self._log(traceback.format_exc().rstrip())
+                    last_error = error
+                    self._sleep(retry_delay)
+                    retry_delay = min(
+                        retry_delay * 2, max(self.poll_seconds, DEFAULT_POLL_SECONDS)
+                    )
                     continue
                 self._sleep(self.poll_seconds)
         finally:
