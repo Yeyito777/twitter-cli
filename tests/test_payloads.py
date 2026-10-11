@@ -1,7 +1,9 @@
 import argparse
 import contextlib
 import io
+import os
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -11,6 +13,9 @@ from src.payload import read_stdin_text
 
 
 BIN = Path(__file__).resolve().parents[1] / "bin" / "twitter"
+# Run the CLI against an empty config so these tests never touch real accounts.
+_CONFIG = tempfile.TemporaryDirectory()
+ENV = {**os.environ, "TWITTER_CONFIG_DIR": _CONFIG.name}
 
 
 class _BytesStdin:
@@ -79,6 +84,7 @@ class PostingPayloadTests(unittest.TestCase):
                 text=True,
                 capture_output=True,
                 check=False,
+                env=ENV,
             )
             self.assertEqual(result.returncode, 2)
             self.assertIn(expected, result.stderr)
@@ -95,6 +101,7 @@ class PostingPayloadTests(unittest.TestCase):
                 text=True,
                 capture_output=True,
                 check=False,
+                env=ENV,
             )
             self.assertEqual(result.returncode, 2)
             self.assertIn(expected, result.stderr)
@@ -123,6 +130,7 @@ class DirectMessagePayloadTests(unittest.TestCase):
                 text=True,
                 capture_output=True,
                 check=False,
+                env=ENV,
             )
             self.assertEqual(result.returncode, 2)
             self.assertIn(expected, result.stderr)
@@ -131,10 +139,10 @@ class DirectMessagePayloadTests(unittest.TestCase):
 
 class PayloadHelpTests(unittest.TestCase):
     def test_top_level_and_command_help_document_stdin_contract(self):
-        top = subprocess.run([str(BIN), "-h"], text=True, capture_output=True)
-        post = subprocess.run([str(BIN), "post", "-h"], text=True, capture_output=True)
-        reply = subprocess.run([str(BIN), "reply", "-h"], text=True, capture_output=True)
-        dm = subprocess.run([str(BIN), "dm", "-h"], text=True, capture_output=True)
+        top = subprocess.run([str(BIN), "-h"], text=True, capture_output=True, env=ENV)
+        post = subprocess.run([str(BIN), "post", "-h"], text=True, capture_output=True, env=ENV)
+        reply = subprocess.run([str(BIN), "reply", "-h"], text=True, capture_output=True, env=ENV)
+        dm = subprocess.run([str(BIN), "dm", "-h"], text=True, capture_output=True, env=ENV)
 
         self.assertIn("read exact UTF-8 text from stdin", top.stdout)
         self.assertIn("Inline tweet text is not accepted", post.stdout)

@@ -10,7 +10,7 @@ export PYTHONPATH="$PROJECT_DIR"
 
 usage() {
     cat <<'EOF'
-usage: twitter <command> [args]
+usage: twitter [-a ALIAS] <command> [args]
 
 commands:
   Reading:
@@ -40,13 +40,20 @@ commands:
     mute / unmute        Mute or unmute a user
     block / unblock      Block or unblock a user
 
-  Auth:
-    login                Set up credentials (paste browser cookies)
-    logout               Remove stored credentials
+  Accounts:
+    accounts             List configured accounts
+    account              Manage named accounts (list, add, migrate, default, remove)
+    login                Refresh an account's credentials (--from-vimbrowser, --stdin)
+    logout               Remove an account's stored credentials
 
   Notify:
     notify               Manage Exocortex reply/quote subscriptions
                          (subscribe, unsubscribe, list, mark, start, stop)
+
+Accounts:
+  Use 'twitter -a NAME <command>' or 'twitter <command> -a NAME ...' to pick an account.
+  Reads use the default account; with several accounts, posts, engagement,
+  DM sends, and notify changes require an explicit -a.
 
 Payload input:
   post, reply, and dm --send read exact UTF-8 text from stdin.
@@ -61,7 +68,42 @@ if [[ $# -eq 0 ]]; then
     exit 1
 fi
 
+# Account selection is process-local. Accept it before or after the command.
+account=""
+account_explicit=0
+take_account() {
+    [[ $account_explicit -eq 0 ]] || { echo "twitter: account may only be selected once" >&2; exit 2; }
+    [[ -n "$1" ]] || { echo "twitter: -a/--account requires an alias" >&2; exit 2; }
+    account="$1"; account_explicit=1
+}
+
+args=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --) args+=("$@"); break ;;
+        -a|--account)
+            [[ $# -ge 2 ]] || { echo "twitter: $1 requires an alias" >&2; exit 2; }
+            take_account "$2"; shift 2 ;;
+        --account=*) take_account "${1#*=}"; shift ;;
+        *) args+=("$1"); shift ;;
+    esac
+done
+set -- "${args[@]}"
+
+if [[ $account_explicit -eq 1 ]]; then
+    export TWITTER_ACCOUNT="$account" TWITTER_ACCOUNT_EXPLICIT=1
+else
+    unset TWITTER_ACCOUNT TWITTER_ACCOUNT_EXPLICIT
+fi
+
+[[ $# -gt 0 ]] || { usage; exit 1; }
 cmd="$1"; shift
+
+# Run a Python call after checking which account it acts as.
+run() {
+    local call="$1"; shift
+    exec "$PYTHON" -c "import sys; from src.accounts import cli_preflight; cli_preflight(sys.argv[1], sys.argv[2:]); $call" "$cmd" "$@"
+}
 
 # Resolve aliases
 case "$cmd" in
@@ -77,15 +119,19 @@ esac
 
 case "$cmd" in
     timeline|tweet|search|profile|tweets|thread|notifications|bookmarks|trending|dms|dm)
-        exec "$PYTHON" -c "import sys; from src.reading import $cmd; $cmd(sys.argv[1:])" "$@" ;;
+        run "from src.reading import $cmd; $cmd(sys.argv[2:])" "$@" ;;
     post|reply|delete)
-        exec "$PYTHON" -c "import sys; from src.posting import $cmd; $cmd(sys.argv[1:])" "$@" ;;
+        run "from src.posting import $cmd; $cmd(sys.argv[2:])" "$@" ;;
     like|unlike|rt|unrt|bookmark|unbookmark|follow|unfollow|mute|unmute|block|unblock)
-        exec "$PYTHON" -c "import sys; from src.engagement import $cmd; $cmd(sys.argv[1:])" "$@" ;;
+        run "from src.engagement import $cmd; $cmd(sys.argv[2:])" "$@" ;;
     login|logout)
-        exec "$PYTHON" -c "import sys; from src.auth import $cmd; $cmd(sys.argv[1:])" "$@" ;;
+        run "from src.auth import $cmd; $cmd(sys.argv[2:])" "$@" ;;
     notify)
-        exec "$PYTHON" -c "import sys; from src.notify import dispatch; dispatch('notify', sys.argv[1:])" "$@" ;;
+        run "from src.notify import dispatch; dispatch('notify', sys.argv[2:])" "$@" ;;
+    accounts)
+        exec "$PYTHON" -c "import sys; from src.accounts import cli_dispatch; cli_dispatch(['list'] + sys.argv[1:])" "$@" ;;
+    account)
+        exec "$PYTHON" -c "import sys; from src.accounts import cli_dispatch; cli_dispatch(sys.argv[1:])" "$@" ;;
     help|--help|-h)
         usage ;;
     *)

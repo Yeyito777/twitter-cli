@@ -86,17 +86,6 @@ DEFAULT_FEATURES = {
     "responsive_web_enhance_cards_enabled": False,
 }
 
-# Cache tokens for the lifetime of the process
-_tokens = None
-
-
-def _get_tokens():
-    global _tokens
-    if _tokens is None:
-        _tokens = get_tokens()
-    return _tokens
-
-
 def _build_headers(tokens, method="GET", path=None):
     headers = {
         "Authorization": f"Bearer {tokens['bearer']}",
@@ -127,12 +116,13 @@ def _build_cookie_header(tokens):
     return f"auth_token={tokens['auth_token']}; ct0={tokens['ct0']}"
 
 
-def graphql_get(query_hash, operation_name, variables, features=None):
+def graphql_get(query_hash, operation_name, variables, features=None, *, tokens=None):
     """Make an authenticated GET request to a Twitter GraphQL endpoint.
 
+    Uses the selected account unless explicit tokens are given.
     Returns parsed JSON response.
     """
-    tokens = _get_tokens()
+    tokens = tokens or get_tokens()
 
     params = {
         "variables": json.dumps(variables, separators=(",", ":")),
@@ -156,12 +146,12 @@ def graphql_get(query_hash, operation_name, variables, features=None):
         raise RuntimeError(f"HTTP {e.code}: {body[:500]}")
 
 
-def graphql_post(query_hash, operation_name, variables, features=None):
+def graphql_post(query_hash, operation_name, variables, features=None, *, tokens=None):
     """Make an authenticated POST request to a Twitter GraphQL endpoint.
 
     Returns parsed JSON response.
     """
-    tokens = _get_tokens()
+    tokens = tokens or get_tokens()
 
     body = json.dumps({
         "variables": variables,
@@ -185,13 +175,13 @@ def graphql_post(query_hash, operation_name, variables, features=None):
         raise RuntimeError(f"HTTP {e.code}: {body[:500]}")
 
 
-def rest_get(endpoint, params=None):
+def rest_get(endpoint, params=None, *, tokens=None):
     """Make an authenticated GET request to a Twitter REST endpoint.
 
     endpoint should start with / (e.g. /1.1/account/settings.json)
     Returns parsed JSON response.
     """
-    tokens = _get_tokens()
+    tokens = tokens or get_tokens()
 
     path = f"/i/api{endpoint}"
     url = f"https://x.com{path}"
@@ -211,13 +201,13 @@ def rest_get(endpoint, params=None):
         raise RuntimeError(f"HTTP {e.code}: {body[:500]}")
 
 
-def rest_post(endpoint, body=None, form=False):
+def rest_post(endpoint, body=None, form=False, *, tokens=None):
     """Make an authenticated POST request to a Twitter REST endpoint.
 
     If form=True, sends body as x-www-form-urlencoded instead of JSON.
     This is required for legacy v1.1 endpoints like friendships/create.
     """
-    tokens = _get_tokens()
+    tokens = tokens or get_tokens()
 
     path = f"/i/api{endpoint}"
     url = f"https://x.com{path}"

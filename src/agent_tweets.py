@@ -3,19 +3,21 @@
 The notification relay uses this to avoid taking over conversations the user
 started manually in the browser/phone. Any tweet successfully created through
 `twitter post` / `twitter reply` is recorded here, and replies/quotes are only
-relayed when they target one of these managed tweet IDs.
+relayed when they target one of these managed tweet IDs. Each account keeps
+its own list; ``account`` defaults to the selected one.
 """
 
 import json
 import time
-from pathlib import Path
 
-from src.auth import PROJECT_ROOT
+from src.accounts import account_dir
 from src.helpers import parse_tweet_ref
 
-CONFIG_DIR = PROJECT_ROOT / "config"
-AGENT_TWEETS_FILE = CONFIG_DIR / "agent-tweets.json"
 MAX_MANAGED_TWEETS = 5000
+
+
+def _agent_tweets_file(account=None):
+    return account_dir(account) / "agent-tweets.json"
 
 
 def _dedupe_tail(items, limit):
@@ -30,18 +32,19 @@ def _dedupe_tail(items, limit):
     return list(reversed(out))[-limit:]
 
 
-def _load_raw():
-    if not AGENT_TWEETS_FILE.exists():
+def _load_raw(account=None):
+    path = _agent_tweets_file(account)
+    if not path.exists():
         return {}
     try:
-        data = json.loads(AGENT_TWEETS_FILE.read_text())
+        data = json.loads(path.read_text())
         return data if isinstance(data, dict) else {}
     except (json.JSONDecodeError, OSError):
         return {}
 
 
-def load_agent_tweets():
-    data = _load_raw()
+def load_agent_tweets(account=None):
+    data = _load_raw(account)
     managed = _dedupe_tail(data.get("managed_tweet_ids", []), MAX_MANAGED_TWEETS)
     details = data.get("tweets", {})
     if not isinstance(details, dict):
@@ -63,23 +66,24 @@ def load_agent_tweets():
     }
 
 
-def save_agent_tweets(data):
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+def save_agent_tweets(data, account=None):
+    path = _agent_tweets_file(account)
+    path.parent.mkdir(parents=True, exist_ok=True)
     data = dict(data)
     data["managed_tweet_ids"] = _dedupe_tail(data.get("managed_tweet_ids", []), MAX_MANAGED_TWEETS)
     data["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
 
-    tmp = AGENT_TWEETS_FILE.with_suffix(".tmp")
+    tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
-    tmp.replace(AGENT_TWEETS_FILE)
+    tmp.replace(path)
 
 
-def record_agent_tweet(tweet_id, *, text="", command="post", reply_to_id=None, quote_id=None, url=""):
+def record_agent_tweet(tweet_id, *, text="", command="post", reply_to_id=None, quote_id=None, url="", account=None):
     tweet_id = parse_tweet_ref(str(tweet_id or ""))
     if not tweet_id:
         return False
 
-    data = load_agent_tweets()
+    data = load_agent_tweets(account)
     ids = data.setdefault("managed_tweet_ids", [])
     ids.append(tweet_id)
     data["managed_tweet_ids"] = _dedupe_tail(ids, MAX_MANAGED_TWEETS)
@@ -94,33 +98,33 @@ def record_agent_tweet(tweet_id, *, text="", command="post", reply_to_id=None, q
         "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
     data.setdefault("tweets", {})[tweet_id] = entry
-    save_agent_tweets(data)
+    save_agent_tweets(data, account)
     return True
 
 
-def unrecord_agent_tweet(tweet_id):
+def unrecord_agent_tweet(tweet_id, account=None):
     tweet_id = parse_tweet_ref(str(tweet_id or ""))
     if not tweet_id:
         return False
-    data = load_agent_tweets()
+    data = load_agent_tweets(account)
     before = len(data.get("managed_tweet_ids", []))
     data["managed_tweet_ids"] = [tid for tid in data.get("managed_tweet_ids", []) if tid != tweet_id]
     data.setdefault("tweets", {}).pop(tweet_id, None)
     changed = len(data.get("managed_tweet_ids", [])) != before
     if changed:
-        save_agent_tweets(data)
+        save_agent_tweets(data, account)
     return changed
 
 
-def is_agent_tweet(tweet_id):
+def is_agent_tweet(tweet_id, account=None):
     tweet_id = parse_tweet_ref(str(tweet_id or ""))
     if not tweet_id:
         return False
-    return tweet_id in set(load_agent_tweets().get("managed_tweet_ids", []))
+    return tweet_id in set(load_agent_tweets(account).get("managed_tweet_ids", []))
 
 
-def list_agent_tweets():
-    data = load_agent_tweets()
+def list_agent_tweets(account=None):
+    data = load_agent_tweets(account)
     ids = data.get("managed_tweet_ids", [])
     details = data.get("tweets", {})
     return ids, details

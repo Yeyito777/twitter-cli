@@ -1,4 +1,8 @@
-"""Manage Twitter reply/quote publications and Exocortex subscriptions."""
+"""Manage Twitter reply/quote publications and Exocortex subscriptions.
+
+One supervised process polls every logged-in account. Each account has its own
+managed tweets, poll state, and Exocortex notification source.
+"""
 
 import argparse
 import fcntl
@@ -12,9 +16,19 @@ import time
 import traceback
 from pathlib import Path
 
+from src.accounts import (
+    ACCOUNT_EXPLICIT_ENV,
+    CONFIG_ROOT,
+    account_dir,
+    account_label,
+    account_meta,
+    load_registry,
+    notify_aliases,
+    selected_alias,
+)
 from src.api import graphql_get
 from src.agent_tweets import is_agent_tweet, list_agent_tweets, record_agent_tweet, unrecord_agent_tweet
-from src.auth import PROJECT_ROOT
+from src.auth import get_tokens
 from src.exocortex import (
     list_external_notification_subscriptions,
     manage_external_tool_daemon,
@@ -27,9 +41,8 @@ from src.format import format_tweet
 from src.helpers import Q, parse_tweet_ref
 from src.parse import parse_timeline_entries, parse_tweet
 
-CONFIG_DIR = PROJECT_ROOT / "config"
+CONFIG_DIR = CONFIG_ROOT
 CONFIG_FILE = CONFIG_DIR / "notify.json"
-STATE_FILE = CONFIG_DIR / "notify-state.json"
 LISTENER_DIR = Path("/tmp/twitter-listeners")
 LOCK_FILE = LISTENER_DIR / "__notify__.lock"
 
@@ -43,6 +56,18 @@ MAX_PENDING_EVENTS = 200
 TOOL_NAME = "twitter"
 NOTIFICATION_SOURCE_ID = "managed-tweet-replies"
 NOTIFICATION_SOURCE_LABEL = "Replies and quotes to agent-managed tweets"
+
+
+def notification_source(alias=None):
+    """Return one account's Exocortex notification source (default: selected account)."""
+    meta = account_meta(alias)
+    if meta["alias"] is None:
+        return {"id": NOTIFICATION_SOURCE_ID, "label": NOTIFICATION_SOURCE_LABEL}
+    return {
+        # A migrated legacy login keeps the original ID so its subscriptions survive.
+        "id": meta.get("notify_source") or f"account:{meta['alias']}:{NOTIFICATION_SOURCE_ID}",
+        "label": f"@{meta.get('screen_name') or meta['alias']} · {NOTIFICATION_SOURCE_LABEL}",
+    }
 
 
 def _read_json_file(path, default=None):
@@ -119,8 +144,12 @@ def _normalize_pending_events(raw):
     return result
 
 
-def _load_state():
-    state = _read_json_file(STATE_FILE)
+def _state_file(alias=None):
+    return account_dir(alias) / "notify-state.json"
+
+
+def _load_state(path):
+    state = _read_json_file(path)
 
     return {
         "initialized": bool(state.get("initialized", False)),
@@ -132,17 +161,18 @@ def _load_state():
     }
 
 
-def _save_state(state):
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+def _save_state(state, path):
+    if not path.parent.exists():
+        return  # the account was removed while it was being polled
     state = dict(state)
     state["seen_entry_ids"] = _dedupe_tail(state.get("seen_entry_ids", []), MAX_SEEN_IDS)
     state["relayed_tweet_ids"] = _dedupe_tail(state.get("relayed_tweet_ids", []), MAX_RELAYED_IDS)
     state["relayed_by_target"] = _normalize_relay_map(state.get("relayed_by_target", {}))
     state["pending_events"] = _normalize_pending_events(state.get("pending_events", {}))
 
-    tmp_file = STATE_FILE.with_suffix(".tmp")
+    tmp_file = path.with_suffix(".tmp")
     tmp_file.write_text(json.dumps(state, indent=2) + "\n")
-    tmp_file.replace(STATE_FILE)
+    tmp_file.replace(path)
 
 
 def get_relay_targets():
@@ -194,7 +224,7 @@ def _migrate_legacy_relay_targets():
     return len(targets)
 
 
-def _find_notify_pids():
+def find_notify_pids():
     try:
         result = subprocess.run(
             ["pgrep", "-f", r"src\.notify\s+__run__"],
@@ -204,11 +234,6 @@ def _find_notify_pids():
         return sorted({int(p) for p in result.stdout.strip().split() if p.strip()})
     except Exception:
         return []
-
-
-def _find_notify_pid():
-    pids = _find_notify_pids()
-    return pids[0] if pids else None
 
 
 def _stop_notify_pids(pids, *, verbose=True):
@@ -236,22 +261,409 @@ def _stop_notify_pids(pids, *, verbose=True):
 
 
 class TwitterNotifyService:
+    """Poll one account's notifications and publish replies to its managed tweets."""
+
+    def __init__(self, alias, log, *, poll_seconds, max_parent_replies):
+        self.alias = alias
+        self.meta = account_meta(alias)
+        self.source = notification_source(alias)
+        self.state_file = _state_file(alias)
+        self.poll_seconds = poll_seconds
+        self.max_parent_replies = max_parent_replies
+        self.fetch_count = DEFAULT_FETCH_COUNT
+        self.state = _load_state(self.state_file)
+        self.state.setdefault("relayed_by_target", {})
+        self.state.setdefault("pending_events", {})
+        # Re-read on every poll so 'twitter login' takes effect without a restart.
+        self.tokens = None
+        # Resolve the authenticated viewer from each notification response.
+        # The legacy verify_credentials REST route no longer exists on X.
+        self.self_id = None
+        self.retry_delay = 30
+        self.last_error = None
+        self.next_poll_at = 0.0
+        prefix = f"[{alias}] " if alias else ""
+        self._log = lambda msg: log(prefix + msg)
+
+    def _fetch_notification_entries(self):
+        variables = {
+            "timeline_type": "All",
+            "count": self.fetch_count,
+        }
+        data = graphql_get(Q["NotificationsTimeline"], "NotificationsTimeline", variables, tokens=self.tokens)
+        viewer = (
+            data.get("data", {})
+            .get("viewer_v2", {}).get("user_results", {}).get("result", {})
+        )
+        viewer_id = str(viewer.get("rest_id") or "")
+        if not viewer_id.isdigit():
+            raise RuntimeError("NotificationsTimeline did not return an authenticated viewer ID")
+        instructions = (
+            viewer.get("notification_timeline", {}).get("timeline", {})
+            .get("instructions")
+        )
+        if not isinstance(instructions, list):
+            raise RuntimeError("NotificationsTimeline did not return timeline instructions")
+
+        if self.self_id != viewer_id:
+            self._log(f"Authenticated notification viewer: X user {viewer_id}")
+        self.self_id = viewer_id
+
+        for inst in instructions:
+            if inst.get("type") == "TimelineAddEntries":
+                return inst.get("entries", [])
+        return []
+
+    def _fetch_tweet(self, tweet_ref):
+        tweet_id = parse_tweet_ref(tweet_ref)
+        if not tweet_id:
+            return None
+
+        variables = {
+            "tweetId": tweet_id,
+            "withCommunity": True,
+            "includePromotedContent": False,
+            "withVoice": True,
+        }
+        data = graphql_get(Q["TweetResultByRestId"], "TweetResultByRestId", variables, tokens=self.tokens)
+        result = data.get("data", {}).get("tweetResult", {}).get("result")
+        return parse_tweet(result)
+
+    def _fetch_thread_items(self, tweet_id):
+        variables = {
+            "focalTweetId": tweet_id,
+            "with_rux_injections": False,
+            "includePromotedContent": False,
+            "withCommunity": True,
+            "withQuickPromoteEligibilityTweetFields": True,
+            "withBirdwatchNotes": True,
+            "withVoice": True,
+            "withV2Timeline": True,
+        }
+        data = graphql_get(Q["TweetDetail"], "TweetDetail", variables, tokens=self.tokens)
+        instructions = (
+            data.get("data", {})
+            .get("threaded_conversation_with_injections_v2", {})
+            .get("instructions", [])
+        )
+
+        entries = []
+        for inst in instructions:
+            if inst.get("type") == "TimelineAddEntries":
+                entries = inst.get("entries", [])
+                break
+
+        items, _ = parse_timeline_entries(entries)
+        return [item for item in items if item.get("type") not in ("notification", "trend")]
+
+    def _format_thread_snapshot(self, items, focal_tweet_id):
+        if not items:
+            return "(no extra thread context available)"
+
+        idx = next((i for i, item in enumerate(items) if item.get("id") == focal_tweet_id), None)
+        if idx is None:
+            window = items[:4]
+        else:
+            start = max(0, idx - 2)
+            end = min(len(items), idx + 3)
+            window = items[start:end]
+
+        blocks = []
+        for item in window:
+            prefix = "[incoming] " if item.get("id") == focal_tweet_id else ""
+            blocks.append(prefix + format_tweet(item))
+        return "\n\n".join(blocks)
+
+    def _build_event(self, event_type, source, incoming_tweet, parent_tweet, reason, *, thread_items=None):
+        return {
+            "event_type": event_type,
+            "source": source,
+            "incoming_tweet": incoming_tweet,
+            "parent_tweet": parent_tweet,
+            "thread_items": list(thread_items or []),
+            "reason": reason,
+            "priority": "high",
+        }
+
+    def _is_own_tweet(self, tweet):
+        return bool(self.self_id and tweet and tweet.get("author_id") == self.self_id)
+
+    def _classify_tweet(self, tweet, source="tweet_item"):
+        if not tweet:
+            return None
+        if self._is_own_tweet(tweet):
+            return None
+
+        if tweet.get("is_reply") and tweet.get("in_reply_to_id"):
+            parent = self._fetch_tweet(tweet.get("in_reply_to_id"))
+            if self._is_own_tweet(parent):
+                if not is_agent_tweet(parent.get("id"), self.alias):
+                    self._log(
+                        f"Skip @{tweet['handle']} reply {tweet['id']}: "
+                        f"parent {parent.get('id')} is not agent-managed"
+                    )
+                    return None
+                parent_replies = int(parent.get("replies", 0) or 0)
+                if parent_replies < self.max_parent_replies:
+                    thread_items = self._fetch_thread_items(tweet["id"])
+                    reason = (
+                        f"Reply to your tweet, parent currently has "
+                        f"{parent_replies} replies (threshold: <{self.max_parent_replies})"
+                    )
+                    return self._build_event(
+                        "direct_reply",
+                        source,
+                        tweet,
+                        parent,
+                        reason,
+                        thread_items=thread_items,
+                    )
+                self._log(
+                    f"Skip @{tweet['handle']} reply {tweet['id']}: "
+                    f"parent already has {parent_replies} replies (threshold <{self.max_parent_replies})"
+                )
+                return None
+
+        if tweet.get("is_quote") and tweet.get("quoted"):
+            quoted = tweet.get("quoted")
+            if self._is_own_tweet(quoted):
+                if not is_agent_tweet(quoted.get("id"), self.alias):
+                    self._log(
+                        f"Skip @{tweet['handle']} quote {tweet['id']}: "
+                        f"quoted tweet {quoted.get('id')} is not agent-managed"
+                    )
+                    return None
+                return self._build_event(
+                    "quote_tweet",
+                    source,
+                    tweet,
+                    quoted,
+                    "Someone quote-tweeted one of your tweets",
+                )
+
+        return None
+
+    def _classify_notification_fallback(self, item):
+        icon = item.get("notification_icon", "")
+        message = item.get("rich_message", {}).get("text", "")
+        url = item.get("notification_url", {}).get("url", "")
+        tweet_id = parse_tweet_ref(url)
+        if not tweet_id:
+            return None
+
+        lower = message.lower()
+        if icon != "reply_icon" and "quoted your" not in lower and "replied to your" not in lower:
+            return None
+
+        tweet = self._fetch_tweet(tweet_id)
+        return self._classify_tweet(tweet, source="notification_fallback")
+
+    def _extract_event_from_entry(self, entry):
+        content = entry.get("content", {})
+        if content.get("__typename") != "TimelineTimelineItem":
+            return None
+
+        item = content.get("itemContent", {})
+        item_type = item.get("__typename")
+        if item_type == "TimelineTweet":
+            tweet = parse_tweet(item.get("tweet_results", {}).get("result"))
+            return self._classify_tweet(tweet)
+        if item_type == "TimelineNotification":
+            return self._classify_notification_fallback(item)
+        return None
+
+    def _format_event_message(self, event):
+        incoming = event["incoming_tweet"]
+        parent = event["parent_tweet"]
+
+        lines = [
+            "[Twitter Reply Notification]",
+            "",
+            f"Type: {event['event_type']}",
+            f"Priority: {event['priority']}",
+            f"Why this was relayed: {event['reason']}",
+            f"Source: {event['source']}",
+            *([f"Account: {account_label(self.meta)}"] if self.alias else []),
+            "",
+            "Author:",
+            f"- @{incoming['handle']} ({incoming['name']})",
+            "",
+            "Incoming tweet:",
+            self._indent(format_tweet(incoming)),
+            "",
+        ]
+
+        if event["event_type"] == "direct_reply":
+            lines.extend([
+                "Your tweet being replied to:",
+                self._indent(format_tweet(parent)),
+                "",
+                "Conversation snapshot:",
+                self._indent(self._format_thread_snapshot(event.get("thread_items", []), incoming["id"])),
+                "",
+            ])
+        else:
+            lines.extend([
+                "Your tweet being quoted:",
+                self._indent(format_tweet(parent)),
+                "",
+            ])
+
+        lines.extend([
+            "Reply-agent task:",
+            "- Decide whether to reply, like, follow, mute, or ignore.",
+            "- Prefer fast, tasteful engagement.",
+            "- Do not force a reply if the signal is weak.",
+            "- You may inspect the thread briefly if needed.",
+            *([f"- Act as this account: pass `-a {self.alias}` to every twitter command."] if self.alias else []),
+        ])
+
+        return "\n".join(lines).rstrip() + "\n"
+
+    def _indent(self, text, prefix="  "):
+        return "\n".join(prefix + line if line else prefix.rstrip() for line in text.splitlines())
+
+    def _publish_event(self, event):
+        msg = self._format_event_message(event)
+        incoming_id = event["incoming_tweet"]["id"]
+        result = publish_external_notification(
+            TOOL_NAME,
+            self.source["id"],
+            incoming_id,
+            msg,
+        )
+        deliveries = list(result.get("deliveries") or [])
+        status_counts = {}
+        for delivery in deliveries:
+            status = delivery.get("status", "unknown")
+            status_counts[status] = status_counts.get(status, 0) + 1
+        summary = ", ".join(
+            f"{count} {status}" for status, count in sorted(status_counts.items())
+        ) or "no subscribers"
+        self._log(f"Published tweet {incoming_id} to Exocortex core: {summary}")
+        return result
+
+    def _mark_fully_relayed(self, incoming_id):
+        self.state.setdefault("relayed_tweet_ids", []).append(incoming_id)
+        self.state.setdefault("pending_events", {}).pop(incoming_id, None)
+
+    def _attempt_event_publish(self, event):
+        incoming_id = event["incoming_tweet"].get("id")
+        if not incoming_id:
+            return False
+
+        if incoming_id in set(self.state.get("relayed_tweet_ids", [])):
+            self.state.setdefault("pending_events", {}).pop(incoming_id, None)
+            return False
+
+        try:
+            result = self._publish_event(event)
+        except Exception as e:
+            self._log(f"Publish error for tweet {incoming_id}: {e}")
+            self.state.setdefault("pending_events", {})[incoming_id] = event
+            return False
+
+        failed_deliveries = [
+            delivery
+            for delivery in (result.get("deliveries") or [])
+            if delivery.get("status") == "failed"
+        ]
+        if failed_deliveries:
+            self._log(
+                f"Publish for tweet {incoming_id} had {len(failed_deliveries)} failed "
+                "delivery target(s); retaining for retry"
+            )
+            self.state.setdefault("pending_events", {})[incoming_id] = event
+            return False
+
+        self._mark_fully_relayed(incoming_id)
+        return True
+
+    def poll_once(self):
+        self.tokens = get_tokens(self.alias)
+        entries = self._fetch_notification_entries()
+        entry_ids = [e.get("entryId") for e in entries if e.get("entryId")]
+
+        if not self.state.get("initialized"):
+            self.state["initialized"] = True
+            self.state["seen_entry_ids"] = entry_ids[-MAX_SEEN_IDS:]
+            self.state["last_poll"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+            _save_state(self.state, self.state_file)
+            self._log(f"Primed state with {len(entry_ids)} existing notifications; no relays sent")
+            return {"primed": len(entry_ids), "relayed": 0, "new_entries": 0, "pending": 0}
+
+        seen_entry_ids = set(self.state.get("seen_entry_ids", []))
+        new_entries = [e for e in entries if e.get("entryId") and e.get("entryId") not in seen_entry_ids]
+
+        relayed = 0
+
+        pending_events = dict(self.state.get("pending_events", {}))
+        for incoming_id, event in pending_events.items():
+            if self._attempt_event_publish(event):
+                relayed += 1
+
+        for entry in reversed(new_entries):
+            event = self._extract_event_from_entry(entry)
+            if not event:
+                continue
+            incoming_id = event["incoming_tweet"].get("id")
+            if not incoming_id:
+                continue
+            if self._attempt_event_publish(event):
+                relayed += 1
+
+        self.state.setdefault("seen_entry_ids", []).extend(entry_ids)
+        self.state["last_poll"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        _save_state(self.state, self.state_file)
+        return {
+            "primed": 0,
+            "relayed": relayed,
+            "new_entries": len(new_entries),
+            "pending": len(self.state.get("pending_events", {})),
+        }
+
+    def poll(self):
+        """Poll once and schedule the next poll, backing off after failures."""
+        try:
+            stats = self.poll_once()
+        except Exception as e:
+            error = (type(e).__name__, str(e))
+            self._log(f"Poll error: {e}; retrying in {self.retry_delay}s")
+            if error != self.last_error:
+                self._log(traceback.format_exc().rstrip())
+            self.last_error = error
+            delay = self.retry_delay
+            self.retry_delay = min(
+                self.retry_delay * 2, max(self.poll_seconds, DEFAULT_POLL_SECONDS)
+            )
+        else:
+            if self.last_error is not None:
+                self._log("Notification polling recovered")
+            self.last_error = None
+            self.retry_delay = 30
+            if not stats["primed"] and (stats["new_entries"] or stats["relayed"] or stats["pending"]):
+                self._log(
+                    f"Poll complete: {stats['new_entries']} new notification entries, "
+                    f"{stats['relayed']} published, {stats['pending']} pending"
+                )
+            delay = self.poll_seconds
+        self.next_poll_at = time.monotonic() + delay
+        return delay
+
+
+class NotifyDaemon:
+    """The supervised process: one lock, one schedule, a poller per logged-in account."""
+
     def __init__(self, log_file):
         self.log_file = Path(log_file)
         self.running = True
         # Set from the signal handler so sleeps end at once: the old 1s sleep
         # steps held up every Exocortex daemon restart by up to a second.
         self._stopping = threading.Event()
-        self.cfg = _load_config()
-        self.poll_seconds = max(30, int(self.cfg.get("poll_seconds", DEFAULT_POLL_SECONDS)))
-        self.max_parent_replies = max(1, int(self.cfg.get("max_parent_replies", DEFAULT_MAX_PARENT_REPLIES)))
-        self.fetch_count = DEFAULT_FETCH_COUNT
-        self.state = _load_state()
-        self.state.setdefault("relayed_by_target", {})
-        self.state.setdefault("pending_events", {})
-        # Resolve the authenticated viewer from each notification response.
-        # The legacy verify_credentials REST route no longer exists on X.
-        self.self_id = None
+        cfg = _load_config()
+        self.poll_seconds = max(30, int(cfg.get("poll_seconds", DEFAULT_POLL_SECONDS)))
+        self.max_parent_replies = max(1, int(cfg.get("max_parent_replies", DEFAULT_MAX_PARENT_REPLIES)))
+        self.services = {}
         self.lock_handle = None
 
         signal.signal(signal.SIGTERM, self._shutdown)
@@ -318,350 +730,43 @@ class TwitterNotifyService:
         if self.running:
             self._stopping.wait(seconds)
 
-    def _fetch_notification_entries(self):
-        variables = {
-            "timeline_type": "All",
-            "count": self.fetch_count,
-        }
-        data = graphql_get(Q["NotificationsTimeline"], "NotificationsTimeline", variables)
-        viewer = (
-            data.get("data", {})
-            .get("viewer_v2", {}).get("user_results", {}).get("result", {})
-        )
-        viewer_id = str(viewer.get("rest_id") or "")
-        if not viewer_id.isdigit():
-            raise RuntimeError("NotificationsTimeline did not return an authenticated viewer ID")
-        instructions = (
-            viewer.get("notification_timeline", {}).get("timeline", {})
-            .get("instructions")
-        )
-        if not isinstance(instructions, list):
-            raise RuntimeError("NotificationsTimeline did not return timeline instructions")
-
-        if self.self_id != viewer_id:
-            self._log(f"Authenticated notification viewer: X user {viewer_id}")
-        self.self_id = viewer_id
-
-        for inst in instructions:
-            if inst.get("type") == "TimelineAddEntries":
-                return inst.get("entries", [])
-        return []
-
-    def _fetch_tweet(self, tweet_ref):
-        tweet_id = parse_tweet_ref(tweet_ref)
-        if not tweet_id:
-            return None
-
-        variables = {
-            "tweetId": tweet_id,
-            "withCommunity": True,
-            "includePromotedContent": False,
-            "withVoice": True,
-        }
-        data = graphql_get(Q["TweetResultByRestId"], "TweetResultByRestId", variables)
-        result = data.get("data", {}).get("tweetResult", {}).get("result")
-        return parse_tweet(result)
-
-    def _fetch_thread_items(self, tweet_id):
-        variables = {
-            "focalTweetId": tweet_id,
-            "with_rux_injections": False,
-            "includePromotedContent": False,
-            "withCommunity": True,
-            "withQuickPromoteEligibilityTweetFields": True,
-            "withBirdwatchNotes": True,
-            "withVoice": True,
-            "withV2Timeline": True,
-        }
-        data = graphql_get(Q["TweetDetail"], "TweetDetail", variables)
-        instructions = (
-            data.get("data", {})
-            .get("threaded_conversation_with_injections_v2", {})
-            .get("instructions", [])
-        )
-
-        entries = []
-        for inst in instructions:
-            if inst.get("type") == "TimelineAddEntries":
-                entries = inst.get("entries", [])
-                break
-
-        items, _ = parse_timeline_entries(entries)
-        return [item for item in items if item.get("type") not in ("notification", "trend")]
-
-    def _format_thread_snapshot(self, items, focal_tweet_id):
-        if not items:
-            return "(no extra thread context available)"
-
-        idx = next((i for i, item in enumerate(items) if item.get("id") == focal_tweet_id), None)
-        if idx is None:
-            window = items[:4]
-        else:
-            start = max(0, idx - 2)
-            end = min(len(items), idx + 3)
-            window = items[start:end]
-
-        blocks = []
-        for item in window:
-            prefix = "[incoming] " if item.get("id") == focal_tweet_id else ""
-            blocks.append(prefix + format_tweet(item))
-        return "\n\n".join(blocks)
-
-    def _build_event(self, event_type, source, incoming_tweet, parent_tweet, reason, *, thread_items=None):
-        return {
-            "event_type": event_type,
-            "source": source,
-            "incoming_tweet": incoming_tweet,
-            "parent_tweet": parent_tweet,
-            "thread_items": list(thread_items or []),
-            "reason": reason,
-            "priority": "high",
-        }
-
-    def _is_own_tweet(self, tweet):
-        return bool(self.self_id and tweet and tweet.get("author_id") == self.self_id)
-
-    def _classify_tweet(self, tweet, source="tweet_item"):
-        if not tweet:
-            return None
-        if self._is_own_tweet(tweet):
-            return None
-
-        if tweet.get("is_reply") and tweet.get("in_reply_to_id"):
-            parent = self._fetch_tweet(tweet.get("in_reply_to_id"))
-            if self._is_own_tweet(parent):
-                if not is_agent_tweet(parent.get("id")):
-                    self._log(
-                        f"Skip @{tweet['handle']} reply {tweet['id']}: "
-                        f"parent {parent.get('id')} is not agent-managed"
-                    )
-                    return None
-                parent_replies = int(parent.get("replies", 0) or 0)
-                if parent_replies < self.max_parent_replies:
-                    thread_items = self._fetch_thread_items(tweet["id"])
-                    reason = (
-                        f"Reply to your tweet, parent currently has "
-                        f"{parent_replies} replies (threshold: <{self.max_parent_replies})"
-                    )
-                    return self._build_event(
-                        "direct_reply",
-                        source,
-                        tweet,
-                        parent,
-                        reason,
-                        thread_items=thread_items,
-                    )
-                self._log(
-                    f"Skip @{tweet['handle']} reply {tweet['id']}: "
-                    f"parent already has {parent_replies} replies (threshold <{self.max_parent_replies})"
-                )
-                return None
-
-        if tweet.get("is_quote") and tweet.get("quoted"):
-            quoted = tweet.get("quoted")
-            if self._is_own_tweet(quoted):
-                if not is_agent_tweet(quoted.get("id")):
-                    self._log(
-                        f"Skip @{tweet['handle']} quote {tweet['id']}: "
-                        f"quoted tweet {quoted.get('id')} is not agent-managed"
-                    )
-                    return None
-                return self._build_event(
-                    "quote_tweet",
-                    source,
-                    tweet,
-                    quoted,
-                    "Someone quote-tweeted one of your tweets",
-                )
-
-        return None
-
-    def _classify_notification_fallback(self, item):
-        icon = item.get("notification_icon", "")
-        message = item.get("rich_message", {}).get("text", "")
-        url = item.get("notification_url", {}).get("url", "")
-        tweet_id = parse_tweet_ref(url)
-        if not tweet_id:
-            return None
-
-        lower = message.lower()
-        if icon != "reply_icon" and "quoted your" not in lower and "replied to your" not in lower:
-            return None
-
-        tweet = self._fetch_tweet(tweet_id)
-        return self._classify_tweet(tweet, source="notification_fallback")
-
-    def _extract_event_from_entry(self, entry):
-        content = entry.get("content", {})
-        if content.get("__typename") != "TimelineTimelineItem":
-            return None
-
-        item = content.get("itemContent", {})
-        item_type = item.get("__typename")
-        if item_type == "TimelineTweet":
-            tweet = parse_tweet(item.get("tweet_results", {}).get("result"))
-            return self._classify_tweet(tweet)
-        if item_type == "TimelineNotification":
-            return self._classify_notification_fallback(item)
-        return None
-
-    def _format_event_message(self, event):
-        incoming = event["incoming_tweet"]
-        parent = event["parent_tweet"]
-
-        lines = [
-            "[Twitter Reply Notification]",
-            "",
-            f"Type: {event['event_type']}",
-            f"Priority: {event['priority']}",
-            f"Why this was relayed: {event['reason']}",
-            f"Source: {event['source']}",
-            "",
-            "Author:",
-            f"- @{incoming['handle']} ({incoming['name']})",
-            "",
-            "Incoming tweet:",
-            self._indent(format_tweet(incoming)),
-            "",
-        ]
-
-        if event["event_type"] == "direct_reply":
-            lines.extend([
-                "Your tweet being replied to:",
-                self._indent(format_tweet(parent)),
-                "",
-                "Conversation snapshot:",
-                self._indent(self._format_thread_snapshot(event.get("thread_items", []), incoming["id"])),
-                "",
-            ])
-        else:
-            lines.extend([
-                "Your tweet being quoted:",
-                self._indent(format_tweet(parent)),
-                "",
-            ])
-
-        lines.extend([
-            "Reply-agent task:",
-            "- Decide whether to reply, like, follow, mute, or ignore.",
-            "- Prefer fast, tasteful engagement.",
-            "- Do not force a reply if the signal is weak.",
-            "- You may inspect the thread briefly if needed.",
-        ])
-
-        return "\n".join(lines).rstrip() + "\n"
-
-    def _indent(self, text, prefix="  "):
-        return "\n".join(prefix + line if line else prefix.rstrip() for line in text.splitlines())
-
-    def _publish_event(self, event):
-        msg = self._format_event_message(event)
-        incoming_id = event["incoming_tweet"]["id"]
-        result = publish_external_notification(
-            TOOL_NAME,
-            NOTIFICATION_SOURCE_ID,
-            incoming_id,
-            msg,
-        )
-        deliveries = list(result.get("deliveries") or [])
-        status_counts = {}
-        for delivery in deliveries:
-            status = delivery.get("status", "unknown")
-            status_counts[status] = status_counts.get(status, 0) + 1
-        summary = ", ".join(
-            f"{count} {status}" for status, count in sorted(status_counts.items())
-        ) or "no subscribers"
-        self._log(f"Published tweet {incoming_id} to Exocortex core: {summary}")
-        return result
-
-    def _mark_fully_relayed(self, incoming_id):
-        self.state.setdefault("relayed_tweet_ids", []).append(incoming_id)
-        self.state.setdefault("pending_events", {}).pop(incoming_id, None)
-
-    def _attempt_event_publish(self, event):
-        incoming_id = event["incoming_tweet"].get("id")
-        if not incoming_id:
-            return False
-
-        if incoming_id in set(self.state.get("relayed_tweet_ids", [])):
-            self.state.setdefault("pending_events", {}).pop(incoming_id, None)
-            return False
-
+    def _sync_services(self):
+        """Start or stop polling accounts as they are added, logged in, or removed."""
         try:
-            result = self._publish_event(event)
+            aliases = notify_aliases()
         except Exception as e:
-            self._log(f"Publish error for tweet {incoming_id}: {e}")
-            self.state.setdefault("pending_events", {})[incoming_id] = event
-            return False
-
-        failed_deliveries = [
-            delivery
-            for delivery in (result.get("deliveries") or [])
-            if delivery.get("status") == "failed"
-        ]
-        if failed_deliveries:
-            self._log(
-                f"Publish for tweet {incoming_id} had {len(failed_deliveries)} failed "
-                "delivery target(s); retaining for retry"
-            )
-            self.state.setdefault("pending_events", {})[incoming_id] = event
-            return False
-
-        self._mark_fully_relayed(incoming_id)
-        return True
-
-    def poll_once(self):
-        entries = self._fetch_notification_entries()
-        entry_ids = [e.get("entryId") for e in entries if e.get("entryId")]
-
-        if not self.state.get("initialized"):
-            self.state["initialized"] = True
-            self.state["seen_entry_ids"] = entry_ids[-MAX_SEEN_IDS:]
-            self.state["last_poll"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-            _save_state(self.state)
-            self._log(f"Primed state with {len(entry_ids)} existing notifications; no relays sent")
-            return {"primed": len(entry_ids), "relayed": 0, "new_entries": 0, "pending": 0}
-
-        seen_entry_ids = set(self.state.get("seen_entry_ids", []))
-        new_entries = [e for e in entries if e.get("entryId") and e.get("entryId") not in seen_entry_ids]
-
-        relayed = 0
-
-        pending_events = dict(self.state.get("pending_events", {}))
-        for incoming_id, event in pending_events.items():
-            if self._attempt_event_publish(event):
-                relayed += 1
-
-        for entry in reversed(new_entries):
-            event = self._extract_event_from_entry(entry)
-            if not event:
+            self._log(f"Could not read Twitter accounts: {e}")
+            return
+        for alias in [alias for alias in self.services if alias not in aliases]:
+            del self.services[alias]
+            self._log(f"Stopped polling account {alias}")
+        for alias in aliases:
+            if alias in self.services:
                 continue
-            incoming_id = event["incoming_tweet"].get("id")
-            if not incoming_id:
+            try:
+                service = TwitterNotifyService(
+                    alias,
+                    self._log,
+                    poll_seconds=self.poll_seconds,
+                    max_parent_replies=self.max_parent_replies,
+                )
+                register_external_notification_source(
+                    TOOL_NAME,
+                    service.source["id"],
+                    service.source["label"],
+                )
+            except Exception as e:
+                self._log(f"Could not start polling {alias or 'the legacy login'}: {e}")
                 continue
-            if self._attempt_event_publish(event):
-                relayed += 1
-
-        self.state.setdefault("seen_entry_ids", []).extend(entry_ids)
-        self.state["last_poll"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-        _save_state(self.state)
-        return {
-            "primed": 0,
-            "relayed": relayed,
-            "new_entries": len(new_entries),
-            "pending": len(self.state.get("pending_events", {})),
-        }
+            self.services[alias] = service
+            self._log(f"Polling {account_label(service.meta)} for source {service.source['id']}")
 
     def run(self):
         if not self._acquire_lock():
             return
 
         try:
-            register_external_notification_source(
-                TOOL_NAME,
-                NOTIFICATION_SOURCE_ID,
-                NOTIFICATION_SOURCE_LABEL,
-            )
+            self._sync_services()
             migrated = _migrate_legacy_relay_targets()
             if migrated:
                 self._log(
@@ -672,34 +777,16 @@ class TwitterNotifyService:
                 "Notify service starting with "
                 f"poll={self.poll_seconds}s threshold=<{self.max_parent_replies} replies"
             )
-            retry_delay = 30
-            last_error = None
             while self.running:
-                try:
-                    stats = self.poll_once()
-                    if last_error is not None:
-                        self._log("Notification polling recovered")
-                    last_error = None
-                    retry_delay = 30
-                    if stats["primed"]:
-                        pass
-                    elif stats["new_entries"] or stats["relayed"] or stats["pending"]:
-                        self._log(
-                            f"Poll complete: {stats['new_entries']} new notification entries, "
-                            f"{stats['relayed']} published, {stats['pending']} pending"
-                        )
-                except Exception as e:
-                    error = (type(e).__name__, str(e))
-                    self._log(f"Poll error: {e}; retrying in {retry_delay}s")
-                    if error != last_error:
-                        self._log(traceback.format_exc().rstrip())
-                    last_error = error
-                    self._sleep(retry_delay)
-                    retry_delay = min(
-                        retry_delay * 2, max(self.poll_seconds, DEFAULT_POLL_SECONDS)
-                    )
-                    continue
-                self._sleep(self.poll_seconds)
+                self._sync_services()
+                for service in list(self.services.values()):
+                    if self.running and service.next_poll_at <= time.monotonic():
+                        service.poll()
+                wake_at = min(
+                    (service.next_poll_at for service in self.services.values()),
+                    default=time.monotonic() + self.poll_seconds,
+                )
+                self._sleep(max(0.0, wake_at - time.monotonic()))
         finally:
             self._release_lock()
             self._log("Notify service stopped")
@@ -719,12 +806,13 @@ def _subscribe(argv, *, prog):
     )
     args = p.parse_args(argv)
 
+    source = notification_source()
     subscription = subscribe_external_notification(
         TOOL_NAME,
-        NOTIFICATION_SOURCE_ID,
+        source["id"],
         args.conv_id,
         delivery=args.delivery,
-        source_label=NOTIFICATION_SOURCE_LABEL,
+        source_label=source["label"],
     )
     delivery = subscription.get("delivery", args.delivery)
     print(f"  Subscribed: {args.conv_id} ({delivery})")
@@ -749,7 +837,7 @@ def _unsubscribe(argv, *, prog):
 
     unsubscribe_external_notification(
         tool_name=TOOL_NAME,
-        source_id=NOTIFICATION_SOURCE_ID,
+        source_id=notification_source()["id"],
         conv_id=args.conv_id,
     )
     print(f"  Unsubscribed: {args.conv_id}")
@@ -764,30 +852,20 @@ def remove(argv):
     _unsubscribe(argv, prog="twitter notify remove")
 
 
+def _listed_aliases():
+    """The explicitly selected account, otherwise every configured one."""
+    if os.environ.get(ACCOUNT_EXPLICIT_ENV) == "1":
+        return [selected_alias()]
+    return sorted(load_registry()["accounts"]) or [None]
+
+
 def list_config(argv):
     p = argparse.ArgumentParser(prog="twitter notify list",
         description="Show Exocortex subscriptions and Twitter polling configuration.")
     p.parse_args(argv)
 
     cfg = _load_config()
-    state = _load_state()
-    pids = _find_notify_pids()
-    subscriptions = list_external_notification_subscriptions(
-        tool_name=TOOL_NAME,
-        source_id=NOTIFICATION_SOURCE_ID,
-    )
-
-    print("  Subscriptions:")
-    if subscriptions:
-        for subscription in subscriptions:
-            conv_id = subscription.get("convId", "?")
-            delivery = subscription.get("delivery", "wake")
-            enabled = "enabled" if subscription.get("enabled", True) else "disabled"
-            subscription_id = subscription.get("id")
-            suffix = f" [{subscription_id}]" if subscription_id else ""
-            print(f"    • {conv_id} ({delivery}, {enabled}){suffix}")
-    else:
-        print("    (none)")
+    pids = find_notify_pids()
 
     legacy_targets = cfg.get("relay_targets", [])
     if legacy_targets:
@@ -800,11 +878,32 @@ def list_config(argv):
         print(f"  PIDs: {', '.join(str(pid) for pid in pids)}")
         if len(pids) > 1:
             print("  Warning: multiple notify listeners detected")
-    print(f"  Pending publications: {len(state.get('pending_events', {}))}")
-    managed_ids, _details = list_agent_tweets()
-    print(f"  Agent-managed tweets: {len(managed_ids)}")
-    if state.get("last_poll"):
-        print(f"  Last poll: {state['last_poll']}")
+
+    for alias in _listed_aliases():
+        source = notification_source(alias)
+        state = _load_state(_state_file(alias))
+        subscriptions = list_external_notification_subscriptions(
+            tool_name=TOOL_NAME,
+            source_id=source["id"],
+        )
+        print()
+        print(f"  {account_label(account_meta(alias))} (source {source['id']})")
+        print("    Subscriptions:")
+        if subscriptions:
+            for subscription in subscriptions:
+                conv_id = subscription.get("convId", "?")
+                delivery = subscription.get("delivery", "wake")
+                enabled = "enabled" if subscription.get("enabled", True) else "disabled"
+                subscription_id = subscription.get("id")
+                suffix = f" [{subscription_id}]" if subscription_id else ""
+                print(f"      • {conv_id} ({delivery}, {enabled}){suffix}")
+        else:
+            print("      (none)")
+        print(f"    Pending publications: {len(state.get('pending_events', {}))}")
+        managed_ids, _details = list_agent_tweets(alias)
+        print(f"    Agent-managed tweets: {len(managed_ids)}")
+        if state.get("last_poll"):
+            print(f"    Last poll: {state['last_poll']}")
 
 
 def mark(argv):
@@ -860,7 +959,7 @@ def start(argv):
         description="Start the supervised Twitter notification poller.")
     p.parse_args(argv)
 
-    existing_pids = _find_notify_pids()
+    existing_pids = find_notify_pids()
     if existing_pids:
         print(
             f"  Found {len(existing_pids)} existing notify listener"
@@ -881,7 +980,7 @@ def stop(argv):
     status = manage_external_tool_daemon("twitter", "stop")
     print(f"  {status.get('message', 'Requested stop for supervised Twitter daemon')}")
 
-    existing_pids = _find_notify_pids()
+    existing_pids = find_notify_pids()
     if existing_pids:
         _stop_notify_pids(existing_pids)
 
@@ -890,8 +989,7 @@ def _run_daemon(argv):
     if len(argv) != 1:
         raise SystemExit("usage: python -m src.notify __run__ <log_file>")
     log_file = argv[0]
-    service = TwitterNotifyService(log_file)
-    service.run()
+    NotifyDaemon(log_file).run()
 
 
 def help_command(argv):
@@ -899,7 +997,8 @@ def help_command(argv):
         prog="twitter notify",
         description=(
             "Publish replies and quotes to agent-managed tweets through "
-            "Exocortex's notification registry."
+            "Exocortex's notification registry. Each account has its own "
+            "managed tweets and subscriptions; select one with -a/--account."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""commands:

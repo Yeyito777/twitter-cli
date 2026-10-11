@@ -9,7 +9,22 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from src import notify
+from src import accounts, notify
+
+
+_config = tempfile.TemporaryDirectory()
+
+
+def setUpModule():
+    # Never read or write the real accounts, credentials, or poll state.
+    for item in (
+        patch.object(accounts, "CONFIG_ROOT", Path(_config.name)),
+        patch.dict(os.environ, {}),
+    ):
+        item.start()
+        unittest.addModuleCleanup(item.stop)
+    os.environ.pop(accounts.ACCOUNT_ENV, None)
+    os.environ.pop(accounts.ACCOUNT_EXPLICIT_ENV, None)
 
 
 def _tweet(tweet_id, handle, author_id=""):
@@ -46,11 +61,18 @@ def _event(tweet_id="incoming-1"):
 
 def _bare_service(state=None):
     service = object.__new__(notify.TwitterNotifyService)
+    service.alias = None
+    service.meta = {"alias": None}
+    service.source = {"id": notify.NOTIFICATION_SOURCE_ID, "label": notify.NOTIFICATION_SOURCE_LABEL}
+    service.state_file = Path(_config.name) / "notify-state.json"
+    service.tokens = {"auth_token": "token", "ct0": "csrf", "bearer": "bearer"}
     service.state = state or {
         "relayed_tweet_ids": [],
         "relayed_by_target": {},
         "pending_events": {},
     }
+    service.retry_delay = 30
+    service.last_error = None
     service._log = Mock()
     return service
 
@@ -62,7 +84,6 @@ class NotifyMigrationTests(unittest.TestCase):
         self.patches = [
             patch.object(notify, "CONFIG_DIR", self.config_dir),
             patch.object(notify, "CONFIG_FILE", self.config_dir / "notify.json"),
-            patch.object(notify, "STATE_FILE", self.config_dir / "notify-state.json"),
         ]
         for item in self.patches:
             item.start()
@@ -210,12 +231,10 @@ class NotifyIdentityTests(unittest.TestCase):
 
     def test_constructor_does_not_make_a_network_request(self):
         with (
-            patch.object(notify, "_load_config", return_value={}),
             patch.object(notify, "_load_state", return_value={}),
-            patch.object(notify.signal, "signal"),
             patch.object(notify, "graphql_get") as graphql,
         ):
-            service = notify.TwitterNotifyService("/unused/notify.log")
+            service = notify.TwitterNotifyService(None, Mock(), poll_seconds=300, max_parent_replies=10)
         self.assertIsNone(service.self_id)
         graphql.assert_not_called()
 
@@ -232,7 +251,7 @@ class NotifyIdentityTests(unittest.TestCase):
         self.assertEqual(service.self_id, "123")
         graphql.assert_called_once_with(
             notify.Q["NotificationsTimeline"], "NotificationsTimeline",
-            {"timeline_type": "All", "count": 50},
+            {"timeline_type": "All", "count": 50}, tokens=service.tokens,
         )
 
     def test_invalid_viewer_or_missing_timeline_does_not_advance_state(self):
@@ -248,6 +267,7 @@ class NotifyIdentityTests(unittest.TestCase):
         for response in responses:
             with (
                 self.subTest(response=response),
+                patch.object(notify, "get_tokens", return_value=service.tokens),
                 patch.object(notify, "graphql_get", return_value=response),
                 patch.object(notify, "_save_state") as save,
                 self.assertRaisesRegex(RuntimeError, "NotificationsTimeline"),
@@ -301,49 +321,61 @@ class NotifyIdentityTests(unittest.TestCase):
 
 
 class NotifyRetryTests(unittest.TestCase):
-    def test_poll_errors_back_off_and_recovery_resets_delay_without_restarting(self):
+    def test_poll_errors_back_off_and_recovery_resets_delay(self):
         service = _bare_service()
-        service.running = True
         service.poll_seconds = 300
-        service.max_parent_replies = 10
-        service._acquire_lock = Mock(return_value=True)
-        service._release_lock = Mock()
         success = {"primed": 0, "new_entries": 0, "relayed": 0, "pending": 0}
         service.poll_once = Mock(side_effect=[
             *[RuntimeError("HTTP 404") for _ in range(6)],
             success, RuntimeError("HTTP 404"),
         ])
 
-        def sleep(_seconds):
-            if service.poll_once.call_count == 8:
-                service.running = False
+        with patch.object(notify.traceback, "format_exc", return_value="trace") as trace:
+            delays = [service.poll() for _ in range(8)]
 
-        service._sleep = Mock(side_effect=sleep)
-        with (
-            patch.object(notify, "register_external_notification_source"),
-            patch.object(notify, "_migrate_legacy_relay_targets", return_value=0),
-            patch.object(notify.traceback, "format_exc", return_value="trace") as trace,
-        ):
-            service.run()
-
-        self.assertEqual(
-            [call.args[0] for call in service._sleep.call_args_list],
-            [30, 60, 120, 240, 300, 300, 300, 30],
-        )
+        self.assertEqual(delays, [30, 60, 120, 240, 300, 300, 300, 30])
         self.assertEqual(trace.call_count, 2)
         service._log.assert_any_call("Notification polling recovered")
-        service._release_lock.assert_called_once()
+
+    def test_daemon_polls_each_account_on_its_own_schedule(self):
+        daemon = object.__new__(notify.NotifyDaemon)
+        daemon.running = True
+        daemon.poll_seconds = 300
+        daemon.max_parent_replies = 10
+        daemon._acquire_lock = Mock(return_value=True)
+        daemon._release_lock = Mock()
+        daemon._log = Mock()
+        healthy, failing = _bare_service(), _bare_service()
+        healthy.poll = Mock(side_effect=lambda: setattr(healthy, "next_poll_at", time.monotonic() + 300))
+        failing.poll = Mock(side_effect=lambda: setattr(failing, "next_poll_at", time.monotonic() + 30))
+        healthy.next_poll_at = failing.next_poll_at = 0.0
+        daemon.services = {"main": healthy, "alt": failing}
+        sleeps = []
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            daemon.running = False
+
+        daemon._sleep = sleep
+        with (
+            patch.object(daemon, "_sync_services"),
+            patch.object(notify, "_migrate_legacy_relay_targets", return_value=0),
+        ):
+            daemon.run()
+
+        healthy.poll.assert_called_once()
+        failing.poll.assert_called_once()
+        self.assertEqual(len(sleeps), 1)
+        self.assertLessEqual(sleeps[0], 30)
+        self.assertGreater(sleeps[0], 29)
 
 
 class NotifyShutdownTests(unittest.TestCase):
     def test_sigterm_ends_a_poll_sleep_immediately(self):
         previous = {sig: signal.getsignal(sig) for sig in (signal.SIGTERM, signal.SIGINT)}
         self.addCleanup(lambda: [signal.signal(sig, handler) for sig, handler in previous.items()])
-        with (
-            patch.object(notify, "_load_config", return_value={}),
-            patch.object(notify, "_load_state", return_value={}),
-        ):
-            service = notify.TwitterNotifyService("/unused/notify.log")
+        with patch.object(notify, "_load_config", return_value={}):
+            service = notify.NotifyDaemon("/unused/notify.log")
         service._log = Mock()
 
         child = os.fork()
@@ -389,12 +421,14 @@ class NotifyCommandTests(unittest.TestCase):
         self.assertIn("Unsubscribed", output.getvalue())
 
     def test_daemon_run_registers_source_before_migration(self):
-        service = _bare_service()
+        service = object.__new__(notify.NotifyDaemon)
         service.running = False
         service.poll_seconds = 300
         service.max_parent_replies = 10
+        service.services = {}
         service._acquire_lock = Mock(return_value=True)
         service._release_lock = Mock()
+        service._log = Mock()
         calls = []
 
         with (
@@ -408,6 +442,7 @@ class NotifyCommandTests(unittest.TestCase):
                 "_migrate_legacy_relay_targets",
                 side_effect=lambda: calls.append("migrate") or 1,
             ),
+            patch.object(notify, "notify_aliases", return_value=[None]),
         ):
             service.run()
 
