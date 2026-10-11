@@ -7,6 +7,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 import traceback
 from pathlib import Path
@@ -238,6 +239,9 @@ class TwitterNotifyService:
     def __init__(self, log_file):
         self.log_file = Path(log_file)
         self.running = True
+        # Set from the signal handler so sleeps end at once: the old 1s sleep
+        # steps held up every Exocortex daemon restart by up to a second.
+        self._stopping = threading.Event()
         self.cfg = _load_config()
         self.poll_seconds = max(30, int(self.cfg.get("poll_seconds", DEFAULT_POLL_SECONDS)))
         self.max_parent_replies = max(1, int(self.cfg.get("max_parent_replies", DEFAULT_MAX_PARENT_REPLIES)))
@@ -302,6 +306,7 @@ class TwitterNotifyService:
         sig_name = signal.Signals(signum).name if signum else "?"
         self._log(f"Received {sig_name}, shutting down")
         self.running = False
+        self._stopping.set()
 
     def _log(self, msg):
         self.log_file.parent.mkdir(parents=True, exist_ok=True)
@@ -310,9 +315,8 @@ class TwitterNotifyService:
             f.write(f"[{ts}] {msg}\n")
 
     def _sleep(self, seconds):
-        deadline = time.time() + seconds
-        while self.running and time.time() < deadline:
-            time.sleep(min(1.0, deadline - time.time()))
+        if self.running:
+            self._stopping.wait(seconds)
 
     def _fetch_notification_entries(self):
         variables = {

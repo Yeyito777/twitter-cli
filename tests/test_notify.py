@@ -1,7 +1,10 @@
 import contextlib
 import io
 import json
+import os
+import signal
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -330,6 +333,31 @@ class NotifyRetryTests(unittest.TestCase):
         self.assertEqual(trace.call_count, 2)
         service._log.assert_any_call("Notification polling recovered")
         service._release_lock.assert_called_once()
+
+
+class NotifyShutdownTests(unittest.TestCase):
+    def test_sigterm_ends_a_poll_sleep_immediately(self):
+        previous = {sig: signal.getsignal(sig) for sig in (signal.SIGTERM, signal.SIGINT)}
+        self.addCleanup(lambda: [signal.signal(sig, handler) for sig, handler in previous.items()])
+        with (
+            patch.object(notify, "_load_config", return_value={}),
+            patch.object(notify, "_load_state", return_value={}),
+        ):
+            service = notify.TwitterNotifyService("/unused/notify.log")
+        service._log = Mock()
+
+        child = os.fork()
+        if child == 0:
+            time.sleep(0.2)
+            os.kill(os.getppid(), signal.SIGTERM)
+            os._exit(0)
+        started = time.monotonic()
+        service._sleep(30)
+        elapsed = time.monotonic() - started
+        os.waitpid(child, 0)
+
+        self.assertFalse(service.running)
+        self.assertLess(elapsed, 0.6)
 
 
 class NotifyCommandTests(unittest.TestCase):
