@@ -19,6 +19,7 @@ from pathlib import Path
 from src.accounts import (
     ACCOUNT_EXPLICIT_ENV,
     CONFIG_ROOT,
+    PROJECT_ROOT,
     account_dir,
     account_label,
     account_meta,
@@ -225,15 +226,33 @@ def _migrate_legacy_relay_targets():
 
 
 def find_notify_pids():
+    """Return this tool's notify daemons.
+
+    Other external tools run their own `src.notify __run__` daemons and a
+    pattern match also catches shells whose command text merely mentions it,
+    so require the exact module arguments and this tool's directory (the
+    daemon command is relative, so its working directory identifies the tool).
+    """
     try:
         result = subprocess.run(
             ["pgrep", "-f", r"src\.notify\s+__run__"],
             capture_output=True,
             text=True,
         )
-        return sorted({int(p) for p in result.stdout.strip().split() if p.strip()})
+        pids = {int(p) for p in result.stdout.strip().split() if p.strip()}
     except Exception:
         return []
+    return sorted(pid for pid in pids if _is_project_daemon(pid))
+
+
+def _is_project_daemon(pid):
+    try:
+        args = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+        cwd = Path(os.readlink(f"/proc/{pid}/cwd")).resolve()
+    except OSError:
+        return False
+    runs_module = any(args[i:i + 3] == [b"-m", b"src.notify", b"__run__"] for i in range(len(args)))
+    return runs_module and cwd == PROJECT_ROOT
 
 
 def _stop_notify_pids(pids, *, verbose=True):

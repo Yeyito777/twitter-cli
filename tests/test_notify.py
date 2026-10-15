@@ -392,6 +392,31 @@ class NotifyShutdownTests(unittest.TestCase):
         self.assertLess(elapsed, 0.6)
 
 
+class NotifyProcessTests(unittest.TestCase):
+    def test_only_this_tools_daemons_are_found(self):
+        daemon = b".venv/bin/python3\0-m\0src.notify\0__run__\0/tmp/log\0"
+        procs = {
+            "101": (daemon, notify.PROJECT_ROOT),
+            # gmail-cli's notifier runs the same command from its own directory.
+            "202": (daemon, Path("/elsewhere/gmail-cli")),
+            # A shell whose command text merely mentions the daemon.
+            "303": (b"zsh\0-c\0grep 'src.notify __run__' log\0", notify.PROJECT_ROOT),
+        }
+
+        def proc(path):
+            entry = procs.get(path.split("/")[2])
+            if entry is None:
+                raise FileNotFoundError(path)
+            return entry
+
+        with (
+            patch.object(notify.subprocess, "run", return_value=Mock(stdout="101\n202\n303\n404\n")),
+            patch.object(notify.Path, "read_bytes", lambda self: proc(str(self))[0]),
+            patch.object(notify.os, "readlink", lambda path: str(proc(path)[1])),
+        ):
+            self.assertEqual(notify.find_notify_pids(), [101])
+
+
 class NotifyCommandTests(unittest.TestCase):
     def test_add_and_remove_remain_registry_aliases(self):
         subscribe = Mock(return_value={"delivery": "inbox"})
