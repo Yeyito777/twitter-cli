@@ -8,14 +8,14 @@ from src.api import graphql_get
 
 
 # ─── GraphQL Query Hashes ─────────────────────────────────
-# Extracted from client-web/main.*.js bundle on 2026-03-01.
-# These change when Twitter deploys new code. See README.md
-# for how to re-extract them.
+# Fallbacks only, refreshed from the live client on 2026-10-19: requests use
+# the query IDs of the live web client (src/webclient.py) whenever it loads.
+# 'twitter doctor' lists the ones that have gone stale.
 
 Q = {
-    "HomeTimeline":         "_J734qKR-wyeEf6vCZ1mfQ",
-    "HomeLatestTimeline":   "csRxUH5ocwnJtPnB3-wr4g",
-    "CreateTweet":          "y362cgN7cwMppu6Hy3JzrQ",
+    "HomeTimeline":         "svLglq6U2wlTyZMGDDcLYQ",
+    "HomeLatestTimeline":   "NmDBT3APtNxDpMqIEauu7A",
+    "CreateTweet":          "wR5Z_lEibLvkew3tF9w-Sg",
     "DeleteTweet":          "nxpZCY2K-I6QoFHAHeojFQ",
     "FavoriteTweet":        "lI07N6Otwv1PhnEgXILM7A",
     "UnfavoriteTweet":      "ZYKSe-w7KEslx3JhSIk5LA",
@@ -23,20 +23,19 @@ Q = {
     "DeleteRetweet":        "ZyZigVsNiFO6v1dEks1eWg",
     "CreateBookmark":       "aoDbu3RHznuiSkQ9aNM67Q",
     "DeleteBookmark":       "Wlmlj2-xzyS1GN3a6cj-mQ",
-    "TweetDetail":          "ShZ7Ptnc5jM_23VVusteFw",
-    "TweetResultByRestId":  "oSBAzPwnB3u5R9KqxACO3Q",
-    "SearchTimeline":       "9AW3D-T7t9Vkvfdmq2L-iQ",
-    "UserByScreenName":     "pLsOiyHJ1eFwPJlNmLp4Bg",
-    "UserTweets":           "LhtwFV9WwCOurTanx8NNfg",
-    "UserTweetsAndReplies": "9ESiiRo8Mhb_jqNIxduCgA",
-    "Followers":            "W16HbbxU_8PjA_nE2JCr9g",
-    "Following":            "ILoifaG-s7J3wWLd29oMSw",
-    "Likes":                "W9r1yWJ5e9mGz6HMDHe8Vg",
-    # Observed in the authenticated notifications page on 2026-10-01.
-    "NotificationsTimeline":"b0C9GbXfaAlL2F-dkJ4Gdg",
-    "Bookmarks":            "VFdMm9iVZxlU6hD86gfW_A",
-    "ExplorePage":          "LERJigZ3fJPNFrouClO-RQ",
-    "GenericTimelineById":  "JuyfK9IWpMEuu8K37e8N8Q",
+    "TweetDetail":          "3BlMtudy4N-d78ch7zTLZQ",
+    "TweetResultByRestId":  "xZfFqfOmKQu_OXekGI59mg",
+    "SearchTimeline":       "irezafrnzav4Ulf1vDkEBg",
+    "UserByScreenName":     "AMIBMjtxEEATh4z8V9GtRg",
+    "UserTweets":           "7_KBXBpG0zBPRN6UCIV0-w",
+    "UserTweetsAndReplies": "bnsYxFljT6y98rFwiGr3fw",
+    "Followers":            "stpzFPAIZ2qv8s2lRzPOnQ",
+    "Following":            "ath0FIohYC_c3Hj3SsxoCg",
+    "Likes":                "mu4us66Q6RRNOywVQhGtRg",
+    "NotificationsTimeline":"EUX2EwvgT4f9F7sC4A59Eg",
+    "Bookmarks":            "VjWsfItbiMLeajpZ90NJeg",
+    "ExplorePage":          "BMib5Px-wibex8mYlOUhmQ",
+    "GenericTimelineById":  "cW93hZ3nlNYbYcUROF5r5A",
 }
 
 
