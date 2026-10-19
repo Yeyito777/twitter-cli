@@ -5,6 +5,40 @@ import urllib.request
 import urllib.parse
 import urllib.error
 from src.auth import get_tokens
+from src.write_guard import ensure_writes_allowed
+
+# Every request has a deadline: a stalled read must not hang a command, or the
+# notify daemon's single polling loop, forever.
+HTTP_TIMEOUT_SECONDS = 30
+
+
+class TwitterAPIError(RuntimeError):
+    """An error response from X, with its HTTP status and X error codes."""
+
+    def __init__(self, status, codes=(), message=""):
+        self.status = status
+        self.codes = frozenset(int(code) for code in codes)
+        super().__init__(f"HTTP {status}: {message}")
+
+
+def error_codes(payload):
+    """X error codes in a response body (GraphQL often returns them with HTTP 200)."""
+    errors = payload.get("errors") if isinstance(payload, dict) else None
+    codes = []
+    for error in errors if isinstance(errors, list) else []:
+        code = error.get("code") if isinstance(error, dict) else None
+        if isinstance(code, int) or (isinstance(code, str) and code.isdigit()):
+            codes.append(int(code))
+    return codes
+
+
+def _http_error(e):
+    body = e.read().decode("utf-8", errors="replace")
+    try:
+        codes = error_codes(json.loads(body))
+    except (json.JSONDecodeError, ValueError):
+        codes = []
+    return TwitterAPIError(e.code, codes, body[:500])
 
 API_BASE = "https://x.com/i/api"
 API_BASE_V2 = "https://api.x.com"
@@ -139,11 +173,10 @@ def graphql_get(query_hash, operation_name, variables, features=None, *, tokens=
     req = urllib.request.Request(url, headers=headers, method="GET")
 
     try:
-        with urllib.request.urlopen(req) as resp:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SECONDS) as resp:
             return json.loads(resp.read())
     except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"HTTP {e.code}: {body[:500]}")
+        raise _http_error(e) from None
 
 
 def graphql_post(query_hash, operation_name, variables, features=None, *, tokens=None):
@@ -151,6 +184,7 @@ def graphql_post(query_hash, operation_name, variables, features=None, *, tokens
 
     Returns parsed JSON response.
     """
+    ensure_writes_allowed(operation_name)
     tokens = tokens or get_tokens()
 
     body = json.dumps({
@@ -168,11 +202,10 @@ def graphql_post(query_hash, operation_name, variables, features=None, *, tokens
     req = urllib.request.Request(url, data=body, headers=headers, method="POST")
 
     try:
-        with urllib.request.urlopen(req) as resp:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SECONDS) as resp:
             return json.loads(resp.read())
     except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"HTTP {e.code}: {body[:500]}")
+        raise _http_error(e) from None
 
 
 def rest_get(endpoint, params=None, *, tokens=None):
@@ -194,11 +227,10 @@ def rest_get(endpoint, params=None, *, tokens=None):
     req = urllib.request.Request(url, headers=headers, method="GET")
 
     try:
-        with urllib.request.urlopen(req) as resp:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SECONDS) as resp:
             return json.loads(resp.read())
     except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"HTTP {e.code}: {body[:500]}")
+        raise _http_error(e) from None
 
 
 def rest_post(endpoint, body=None, form=False, *, tokens=None):
@@ -207,6 +239,7 @@ def rest_post(endpoint, body=None, form=False, *, tokens=None):
     If form=True, sends body as x-www-form-urlencoded instead of JSON.
     This is required for legacy v1.1 endpoints like friendships/create.
     """
+    ensure_writes_allowed(endpoint)
     tokens = tokens or get_tokens()
 
     path = f"/i/api{endpoint}"
@@ -226,8 +259,7 @@ def rest_post(endpoint, body=None, form=False, *, tokens=None):
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
 
     try:
-        with urllib.request.urlopen(req) as resp:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SECONDS) as resp:
             return json.loads(resp.read())
     except urllib.error.HTTPError as e:
-        resp_body = e.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"HTTP {e.code}: {resp_body[:500]}")
+        raise _http_error(e) from None

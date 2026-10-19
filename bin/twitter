@@ -102,7 +102,15 @@ cmd="$1"; shift
 # Run a Python call after checking which account it acts as.
 run() {
     local call="$1"; shift
-    exec "$PYTHON" -c "import sys; from src.accounts import cli_preflight; cli_preflight(sys.argv[1], sys.argv[2:]); $call" "$cmd" "$@"
+    exec "$PYTHON" -c "import sys
+from src.accounts import cli_preflight
+from src.write_guard import WritePaused
+cli_preflight(sys.argv[1], sys.argv[2:])
+try:
+    $call
+except WritePaused as e:
+    print(f'Error: {e}', file=sys.stderr)
+    sys.exit(3)" "$cmd" "$@"
 }
 
 # Resolve aliases
