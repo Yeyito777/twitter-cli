@@ -505,63 +505,60 @@ def dm(argv):
             print(f"[{m['time']}] @{m['sender']}: {m['text']}")
 
 
+def _one_to_one_conversation(user_id):
+    """The existing 1:1 conversation with user_id, never a group that includes them."""
+    data = rest_get("/1.1/dm/inbox_initial_state.json", DM_PARAMS)
+    convos = data.get("inbox_initial_state", {}).get("conversations", {})
+    for cid, conv in convos.items():
+        if conv.get("type") != "ONE_TO_ONE":
+            continue
+        pids = [str(pt.get("user_id")) for pt in conv.get("participants", [])]
+        if str(user_id) in pids:
+            return cid
+    return None
+
+
 def _resolve_dm_conv_id(ref):
     """Resolve a @username or conversation ID to a conversation ID."""
     if ref.replace("-", "").isdigit():
         return ref
 
     user_id, _ = resolve_user_id(ref)
-    data = rest_get("/1.1/dm/inbox_initial_state.json", DM_PARAMS)
-    inbox = data.get("inbox_initial_state", {})
-    convos = inbox.get("conversations", {})
-    for cid, conv in convos.items():
-        pids = [pt["user_id"] for pt in conv.get("participants", [])]
-        if user_id in pids:
-            return cid
+    conv_id = _one_to_one_conversation(user_id)
+    if conv_id:
+        return conv_id
 
-    print(f"No conversation found with @{ref.lstrip('@')}", file=sys.stderr)
+    print(f"No 1:1 conversation found with @{ref.lstrip('@')}", file=sys.stderr)
     sys.exit(1)
 
 
 def _dm_send(conversation, text):
-    """Send a DM."""
+    """Send a DM to @user (their 1:1 conversation) or to an explicit conversation ID."""
+    import uuid
+
     from src.api import rest_post
 
-    conv_id = conversation
-
-    # If a @username is given, resolve to conversation ID
-    if not conv_id.replace("-", "").isdigit():
-        user_id, _ = resolve_user_id(conv_id)
-        data = rest_get("/1.1/dm/inbox_initial_state.json", DM_PARAMS)
-        inbox = data.get("inbox_initial_state", {})
-        convos = inbox.get("conversations", {})
-        found = False
-        for cid, conv in convos.items():
-            pids = [pt["user_id"] for pt in conv.get("participants", [])]
-            if user_id in pids:
-                conv_id = cid
-                found = True
-                break
-        if not found:
-            # New conversation to a user
-            payload = {
-                "recipient_ids": [user_id],
-                "text": text,
-                "cards_platform": "Web-12",
-                "include_cards": 1,
-            }
-            rest_post("/1.1/dm/new2.json", payload)
-            print("DM sent.")
-            return
-
     payload = {
-        "conversation_id": conv_id,
         "text": text,
         "cards_platform": "Web-12",
         "include_cards": 1,
         "include_quote_count": True,
         "dm_users": False,
+        "request_id": str(uuid.uuid4()),
     }
+    if conversation.replace("-", "").isdigit():
+        payload["conversation_id"] = conversation
+        destination = f"conversation {conversation}"
+    else:
+        handle = conversation.lstrip("@")
+        user_id, _ = resolve_user_id(handle)
+        conv_id = _one_to_one_conversation(user_id)
+        if conv_id:
+            payload["conversation_id"] = conv_id
+            destination = f"@{handle} (1:1 conversation {conv_id})"
+        else:
+            payload["recipient_ids"] = [user_id]
+            destination = f"@{handle} (user {user_id}, new 1:1 conversation)"
 
     rest_post("/1.1/dm/new2.json", payload)
-    print("DM sent.")
+    print(f"DM sent to {destination}.")

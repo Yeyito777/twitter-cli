@@ -179,13 +179,14 @@ def preflight(cmd, argv):
     explicit = os.environ.get(ACCOUNT_EXPLICIT_ENV) == "1"
     if not accounts and not explicit:
         return
-    if len(accounts) > 1 and not explicit and _is_mutating(cmd, argv):
+    if not explicit and _is_mutating(cmd, argv):
+        # Even with one account: that account may be the user's own.
         choices = "\n".join(
             f"  {account_label({**meta, 'alias': alias})}" for alias, meta in sorted(accounts.items())
         )
         raise AccountError(
-            "Multiple Twitter accounts are configured; this command requires "
-            "'-a/--account <alias>'.\n" + choices
+            "This command writes to Twitter and requires '-a/--account <alias>', "
+            "even with one account.\n" + choices
         )
     meta = account_meta()
     if len(accounts) > 1 or explicit:
@@ -352,6 +353,26 @@ def remove_account(argv):
     print(f"Removed Twitter account: {alias}")
 
 
+def unlock_account(argv):
+    from src.write_guard import active_lockout, clear_lockout
+
+    p = argparse.ArgumentParser(
+        allow_abbrev=False,
+        prog="twitter account unlock",
+        description="Clear the write pause X's automated/locked answer put on an account. "
+                    "Only after checking the account on x.com.",
+    )
+    p.add_argument("alias")
+    args = p.parse_args(argv)
+    alias = normalize_alias(args.alias)
+    if alias not in load_registry()["accounts"]:
+        raise AccountError(f"Twitter account '{alias}' is not configured.")
+    marker = active_lockout(alias)
+    print(f"Cleared write pause for {alias}." if clear_lockout(alias) else f"{alias} had no write pause.")
+    if marker:
+        print(f"  It was set by error {marker.get('codes')} on {marker.get('operation')} at {marker.get('since')}.")
+
+
 _COMMANDS = {
     "list": list_accounts,
     "ls": list_accounts,
@@ -359,6 +380,7 @@ _COMMANDS = {
     "migrate": migrate_legacy,
     "default": set_default,
     "remove": remove_account,
+    "unlock": unlock_account,
 }
 
 
@@ -368,7 +390,7 @@ def dispatch(argv):
         return
     subcmd, rest = argv[0], argv[1:]
     if subcmd in ("-h", "--help", "help"):
-        print("usage: twitter account <list|add|migrate|default|remove> [args]")
+        print("usage: twitter account <list|add|migrate|default|remove|unlock> [args]")
         print("Run 'twitter account <subcommand> --help' for details.")
         return
     fn = _COMMANDS.get(subcmd)

@@ -96,9 +96,16 @@ class PreflightTests(AccountTestCase):
             accounts.preflight(cmd, argv)
         return stderr.getvalue()
 
-    def test_single_account_never_needs_a_selection(self):
+    def test_single_account_reads_need_no_selection(self):
         self.write_registry({"main": MAIN})
-        self.assertEqual(self.preflight("post", []), "")
+        self.assertEqual(self.preflight("timeline", []), "")
+
+    def test_single_account_writes_still_require_an_explicit_account(self):
+        # The only account may be the user's own: never post as it by default.
+        self.write_registry({"main": MAIN})
+        for cmd, argv in (("post", []), ("like", ["1"]), ("dm", ["@x", "--send"]), ("follow", ["x"])):
+            with self.subTest(cmd=cmd), self.assertRaisesRegex(accounts.AccountError, "even with one account"):
+                accounts.preflight(cmd, argv)
 
     def test_mutations_require_an_explicit_account_when_several_exist(self):
         self.write_registry({"main": MAIN, "alt": ALT}, default="main")

@@ -5,7 +5,7 @@ import urllib.request
 import urllib.parse
 import urllib.error
 from src.auth import get_tokens
-from src.write_guard import ensure_writes_allowed
+from src.write_guard import ensure_writes_allowed, record_write_error
 
 # Every request has a deadline: a stalled read must not hang a command, or the
 # notify daemon's single polling loop, forever.
@@ -200,12 +200,26 @@ def graphql_post(query_hash, operation_name, variables, features=None, *, tokens
     headers["Cookie"] = _build_cookie_header(tokens)
 
     req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    return _send_write(req, operation_name)
 
+
+def _send_write(req, operation):
+    """Send one write; X errors (even with HTTP 200) raise, and may pause writes."""
     try:
         with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SECONDS) as resp:
-            return json.loads(resp.read())
+            data = json.loads(resp.read())
     except urllib.error.HTTPError as e:
-        raise _http_error(e) from None
+        error = _http_error(e)
+        record_write_error(error.codes, str(error), operation)
+        raise error from None
+    if isinstance(data, dict) and data.get("errors"):
+        codes = error_codes(data)
+        messages = "; ".join(
+            str(err.get("message") or err) for err in data["errors"] if isinstance(err, dict)
+        ) or json.dumps(data["errors"])[:300]
+        record_write_error(codes, messages, operation)
+        raise TwitterAPIError(200, codes, messages)
+    return data
 
 
 def rest_get(endpoint, params=None, *, tokens=None):
@@ -257,9 +271,4 @@ def rest_post(endpoint, body=None, form=False, *, tokens=None):
         data = None
 
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
-
-    try:
-        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SECONDS) as resp:
-            return json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        raise _http_error(e) from None
+    return _send_write(req, endpoint)

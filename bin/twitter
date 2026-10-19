@@ -42,7 +42,7 @@ commands:
 
   Accounts:
     accounts             List configured accounts
-    account              Manage named accounts (list, add, migrate, default, remove)
+    account              Manage named accounts (list, add, migrate, default, remove, unlock)
     login                Refresh an account's credentials (--from-vimbrowser, --stdin)
     logout               Remove an account's stored credentials
 
@@ -110,7 +110,10 @@ try:
     $call
 except WritePaused as e:
     print(f'Error: {e}', file=sys.stderr)
-    sys.exit(3)" "$cmd" "$@"
+    sys.exit(3)
+except RuntimeError as e:
+    print(f'Error: {e}', file=sys.stderr)
+    sys.exit(1)" "$cmd" "$@"
 }
 
 # Resolve aliases

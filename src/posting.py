@@ -65,13 +65,6 @@ def _post_text(text, *, reply=None, quote=None):
     )
     parsed = parse_tweet(result)
 
-    # Check for errors in the response
-    errors = data.get("errors", [])
-    if errors:
-        for err in errors:
-            print(f"Error: {err.get('message', 'Unknown error')}", file=sys.stderr)
-        sys.exit(1)
-
     if parsed:
         record_agent_tweet(
             parsed.get("id"),
