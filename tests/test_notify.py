@@ -72,6 +72,8 @@ def _bare_service(state=None):
         "pending_events": {},
     }
     service.retry_delay = 30
+    service.throttle_delay = notify.THROTTLE_BACKOFF_SECONDS[0]
+    service.dead_login = None
     service.last_error = None
     service._log = Mock()
     return service
@@ -330,12 +332,72 @@ class NotifyRetryTests(unittest.TestCase):
             success, RuntimeError("HTTP 404"),
         ])
 
-        with patch.object(notify.traceback, "format_exc", return_value="trace") as trace:
+        with (
+            patch.object(notify.traceback, "format_exc", return_value="trace") as trace,
+            patch.object(notify.random, "uniform", return_value=1.0),
+        ):
             delays = [service.poll() for _ in range(8)]
 
         self.assertEqual(delays, [30, 60, 120, 240, 300, 300, 300, 30])
         self.assertEqual(trace.call_count, 2)
         service._log.assert_any_call("Notification polling recovered")
+
+    def test_successful_polls_are_jittered_and_never_exactly_periodic(self):
+        service = _bare_service()
+        service.poll_seconds = 600
+        service.poll_once = Mock(return_value={"primed": 0, "new_entries": 0, "relayed": 0, "pending": 0})
+        delays = [service.poll() for _ in range(40)]
+        low, high = (600 * factor for factor in notify.POLL_JITTER)
+        self.assertTrue(all(low <= delay <= high for delay in delays))
+        self.assertGreater(len(set(delays)), 30)
+
+    def test_daemon_enforces_the_minimum_interval_over_config(self):
+        with patch.object(notify, "_load_config", return_value={"poll_seconds": 300, "max_parent_replies": 10}):
+            daemon = notify.NotifyDaemon(Path(_config.name) / "notify.log")
+        self.assertEqual(daemon.poll_seconds, notify.MIN_POLL_SECONDS)
+
+    def test_automated_or_rate_limited_answers_back_off_for_hours(self):
+        service = _bare_service()
+        service.poll_seconds = 600
+        service.poll_once = Mock(side_effect=[
+            notify.TwitterAPIError(200, [226], "automated"),
+            notify.TwitterAPIError(429, [88], "rate limit"),
+            *[notify.TwitterAPIError(403, [], "forbidden") for _ in range(4)],
+        ])
+        delays = [service.poll() for _ in range(6)]
+        self.assertEqual(delays, [1800, 3600, 7200, 14400, 21600, 21600])
+
+    def test_rejected_login_stops_polling_until_credentials_change(self):
+        service = _bare_service()
+        service.alias = "main"
+        service.poll_seconds = 600
+        creds = Path(_config.name) / "accounts" / "main" / "credentials.json"
+        creds.parent.mkdir(parents=True, exist_ok=True)
+        creds.write_text("{}")
+        success = {"primed": 0, "new_entries": 0, "relayed": 0, "pending": 0}
+        service.poll_once = Mock(side_effect=[notify.TwitterAPIError(401, [32], "bad auth"), success])
+        self.assertEqual(service.poll(), notify.DEAD_LOGIN_RECHECK_SECONDS)
+        for _ in range(5):
+            service.poll()
+        self.assertEqual(service.poll_once.call_count, 1)  # no requests with the dead login
+        os.utime(creds, ns=(time.time_ns(), time.time_ns() + 10**9))
+        service.poll()
+        self.assertEqual(service.poll_once.call_count, 2)
+        self.assertIsNone(service.dead_login)
+
+    def test_locked_or_suspended_codes_count_as_a_dead_login(self):
+        for codes in ([326], [64], [89]):
+            self.assertEqual(notify.classify_poll_error(notify.TwitterAPIError(200, codes)), "dead")
+        self.assertEqual(notify.classify_poll_error(RuntimeError("timed out")), "transient")
+        self.assertEqual(notify.classify_poll_error(notify.TwitterAPIError(503, [])), "transient")
+
+    def test_notification_errors_without_a_viewer_raise_typed_errors(self):
+        service = _bare_service()
+        service.fetch_count = 50
+        with patch.object(notify, "graphql_get", return_value={"errors": [{"code": 326, "message": "locked"}]}):
+            with self.assertRaises(notify.TwitterAPIError) as caught:
+                service._fetch_notification_entries()
+        self.assertEqual(caught.exception.codes, {326})
 
     def test_daemon_polls_each_account_on_its_own_schedule(self):
         daemon = object.__new__(notify.NotifyDaemon)

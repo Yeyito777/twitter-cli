@@ -8,6 +8,7 @@ import argparse
 import fcntl
 import json
 import os
+import random
 import signal
 import subprocess
 import sys
@@ -27,7 +28,7 @@ from src.accounts import (
     notify_aliases,
     selected_alias,
 )
-from src.api import graphql_get
+from src.api import TwitterAPIError, error_codes, graphql_get
 from src.agent_tweets import is_agent_tweet, list_agent_tweets, record_agent_tweet, unrecord_agent_tweet
 from src.auth import get_tokens
 from src.exocortex import (
@@ -47,7 +48,18 @@ CONFIG_FILE = CONFIG_DIR / "notify.json"
 LISTENER_DIR = Path("/tmp/twitter-listeners")
 LOCK_FILE = LISTENER_DIR / "__notify__.lock"
 
-DEFAULT_POLL_SECONDS = 300
+# A fixed, round-the-clock cadence is an automation signature, so polls are
+# never closer than MIN_POLL_SECONDS and each delay is jittered.
+DEFAULT_POLL_SECONDS = 600
+MIN_POLL_SECONDS = 600
+POLL_JITTER = (0.7, 1.35)
+# After "looks automated"/rate-limit answers, back off for hours, not minutes.
+THROTTLE_CODES = frozenset({88, 226})
+THROTTLE_BACKOFF_SECONDS = (30 * 60, 6 * 60 * 60)
+# A login X rejects (bad/expired cookies, suspended, locked) is not polled
+# again until its credentials file changes ('twitter -a ALIAS login').
+DEAD_LOGIN_CODES = frozenset({32, 64, 89, 141, 326})
+DEAD_LOGIN_RECHECK_SECONDS = 60
 DEFAULT_MAX_PARENT_REPLIES = 10  # exclusive upper bound: relay when parent replies < 10
 DEFAULT_FETCH_COUNT = 50
 MAX_SEEN_IDS = 1000
@@ -299,8 +311,10 @@ class TwitterNotifyService:
         # The legacy verify_credentials REST route no longer exists on X.
         self.self_id = None
         self.retry_delay = 30
+        self.throttle_delay = THROTTLE_BACKOFF_SECONDS[0]
         self.last_error = None
         self.next_poll_at = 0.0
+        self.dead_login = None  # credentials mtime when X rejected this login
         prefix = f"[{alias}] " if alias else ""
         self._log = lambda msg: log(prefix + msg)
 
@@ -316,6 +330,9 @@ class TwitterNotifyService:
         )
         viewer_id = str(viewer.get("rest_id") or "")
         if not viewer_id.isdigit():
+            codes = error_codes(data)
+            if codes:
+                raise TwitterAPIError(200, codes, json.dumps(data.get("errors"))[:500])
             raise RuntimeError("NotificationsTimeline did not return an authenticated viewer ID")
         instructions = (
             viewer.get("notification_timeline", {}).get("timeline", {})
@@ -641,33 +658,79 @@ class TwitterNotifyService:
             "pending": len(self.state.get("pending_events", {})),
         }
 
+    def _credentials_mtime(self):
+        try:
+            return (account_dir(self.alias) / "credentials.json").stat().st_mtime_ns
+        except OSError:
+            return None
+
+    def _poll_delay(self):
+        return self.poll_seconds * random.uniform(*POLL_JITTER)
+
     def poll(self):
         """Poll once and schedule the next poll, backing off after failures."""
+        if self.dead_login is not None:
+            if self._credentials_mtime() == self.dead_login:
+                # No network: wait for 'twitter login' to replace the cookies.
+                self.next_poll_at = time.monotonic() + DEAD_LOGIN_RECHECK_SECONDS
+                return DEAD_LOGIN_RECHECK_SECONDS
+            self.dead_login = None
+            self._log("Credentials changed; resuming notification polling")
         try:
             stats = self.poll_once()
         except Exception as e:
+            kind = classify_poll_error(e)
+            if kind == "dead":
+                self.dead_login = self._credentials_mtime()
+                self.last_error = (type(e).__name__, str(e))
+                relogin = f"twitter -a {self.alias} login" if self.alias else "twitter login"
+                self._log(
+                    f"X rejected this login ({e}); stopped polling until "
+                    f"'{relogin}' replaces its credentials"
+                )
+                self.next_poll_at = time.monotonic() + DEAD_LOGIN_RECHECK_SECONDS
+                return DEAD_LOGIN_RECHECK_SECONDS
+            if kind == "throttle":
+                delay = self.throttle_delay
+                self.throttle_delay = min(self.throttle_delay * 2, THROTTLE_BACKOFF_SECONDS[1])
+                self._log(f"X throttled or flagged polling ({e}); backing off {delay // 60} min")
+                self.last_error = (type(e).__name__, str(e))
+                self.next_poll_at = time.monotonic() + delay
+                return delay
             error = (type(e).__name__, str(e))
             self._log(f"Poll error: {e}; retrying in {self.retry_delay}s")
             if error != self.last_error:
                 self._log(traceback.format_exc().rstrip())
             self.last_error = error
             delay = self.retry_delay
-            self.retry_delay = min(
-                self.retry_delay * 2, max(self.poll_seconds, DEFAULT_POLL_SECONDS)
-            )
+            self.retry_delay = min(self.retry_delay * 2, self.poll_seconds)
         else:
             if self.last_error is not None:
                 self._log("Notification polling recovered")
             self.last_error = None
             self.retry_delay = 30
+            self.throttle_delay = THROTTLE_BACKOFF_SECONDS[0]
             if not stats["primed"] and (stats["new_entries"] or stats["relayed"] or stats["pending"]):
                 self._log(
                     f"Poll complete: {stats['new_entries']} new notification entries, "
                     f"{stats['relayed']} published, {stats['pending']} pending"
                 )
-            delay = self.poll_seconds
+            delay = self._poll_delay()
         self.next_poll_at = time.monotonic() + delay
         return delay
+
+
+def classify_poll_error(error):
+    """'dead' (X rejects the login), 'throttle' (slow down for hours), or 'transient'."""
+    if not isinstance(error, TwitterAPIError):
+        return "transient"
+    if error.status == 429 or error.codes & THROTTLE_CODES:
+        return "throttle"
+    if error.status == 401 or error.codes & DEAD_LOGIN_CODES:
+        return "dead"
+    if error.status == 403:
+        return "throttle"
+    return "transient"
 
 
 class NotifyDaemon:
@@ -680,7 +743,7 @@ class NotifyDaemon:
         # steps held up every Exocortex daemon restart by up to a second.
         self._stopping = threading.Event()
         cfg = _load_config()
-        self.poll_seconds = max(30, int(cfg.get("poll_seconds", DEFAULT_POLL_SECONDS)))
+        self.poll_seconds = max(MIN_POLL_SECONDS, int(cfg.get("poll_seconds", DEFAULT_POLL_SECONDS)))
         self.max_parent_replies = max(1, int(cfg.get("max_parent_replies", DEFAULT_MAX_PARENT_REPLIES)))
         self.services = {}
         self.lock_handle = None
@@ -794,7 +857,7 @@ class NotifyDaemon:
                 )
             self._log(
                 "Notify service starting with "
-                f"poll={self.poll_seconds}s threshold=<{self.max_parent_replies} replies"
+                f"poll≈{self.poll_seconds}s (jittered) threshold=<{self.max_parent_replies} replies"
             )
             while self.running:
                 self._sync_services()
@@ -890,7 +953,9 @@ def list_config(argv):
     if legacy_targets:
         print(f"  Legacy targets awaiting daemon migration: {len(legacy_targets)}")
 
-    print(f"  Poll interval: {cfg.get('poll_seconds', DEFAULT_POLL_SECONDS)}s")
+    base = max(MIN_POLL_SECONDS, cfg.get('poll_seconds', DEFAULT_POLL_SECONDS))
+    low, high = (round(base * factor) for factor in POLL_JITTER)
+    print(f"  Poll interval: {low}-{high}s (jittered)")
     print(f"  Parent reply threshold: <{cfg.get('max_parent_replies', DEFAULT_MAX_PARENT_REPLIES)} replies")
     print(f"  Listener running: {'yes' if pids else 'no'}")
     if pids:
