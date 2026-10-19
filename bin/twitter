@@ -46,6 +46,9 @@ commands:
     login                Refresh an account's credentials (--from-vimbrowser, --stdin)
     logout               Remove an account's stored credentials
 
+  Health:
+    doctor               Check the browser identity and whether writes may run
+
   Notify:
     notify               Manage Exocortex reply/quote subscriptions
                          (subscribe, unsubscribe, list, mark, start, stop)
@@ -137,6 +140,8 @@ case "$cmd" in
         run "from src.engagement import $cmd; $cmd(sys.argv[2:])" "$@" ;;
     login|logout)
         run "from src.auth import $cmd; $cmd(sys.argv[2:])" "$@" ;;
+    doctor)
+        run "from src.doctor import doctor; doctor(sys.argv[2:])" "$@" ;;
     notify)
         run "from src.notify import dispatch; dispatch('notify', sys.argv[2:])" "$@" ;;
     accounts)

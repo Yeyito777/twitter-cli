@@ -111,7 +111,9 @@ def _asset(name):
         raise WebClientError(f"unexpected script name {name!r}")
     path = _asset_dir() / name
     try:
-        return path.read_text()
+        text = path.read_text()
+        os.utime(path)  # still in use: keep it past pruning
+        return text
     except OSError:
         pass
     response = transport.request("GET", ASSET_BASE + name, headers=fingerprint.script_headers())
@@ -119,10 +121,25 @@ def _asset(name):
         raise WebClientError(f"HTTP {response.status} loading {name}")
     text = response.text()
     path.parent.mkdir(parents=True, exist_ok=True)
+    _prune_assets(path.parent)
     tmp = path.with_suffix(".tmp")
     tmp.write_text(text)
     tmp.replace(path)
     return text
+
+
+ASSET_MAX_AGE = 30 * 24 * 60 * 60
+
+
+def _prune_assets(directory):
+    """Drop scripts of old client deployments; each new deploy adds ~2 MB."""
+    cutoff = time.time() - ASSET_MAX_AGE
+    for old in directory.glob("*.js"):
+        try:
+            if old.stat().st_mtime < cutoff:
+                old.unlink()
+        except OSError:
+            pass
 
 
 def _operation_chunks(html):

@@ -1,4 +1,5 @@
 import json
+import time
 import os
 import subprocess
 import tempfile
@@ -126,3 +127,39 @@ class CliTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("requires '-a/--account <alias>'", result.stderr)
         self.assertNotIn("Traceback", result.stderr)
+
+
+class DoctorTests(_Account):
+    def run_doctor(self, problems, snapshot=None):
+        import contextlib
+        import io
+
+        from src import doctor
+
+        out = io.StringIO()
+        with (
+            patch.object(doctor, "get_tokens", return_value=TOKENS),
+            patch.object(doctor, "self_check", return_value=(list(problems), snapshot)),
+            contextlib.redirect_stdout(out),
+        ):
+            doctor.doctor([])
+        return out.getvalue()
+
+    def test_reports_paused_with_reasons(self):
+        out = self.run_doctor(["the live X web client could not be loaded (HTTP 503)"])
+        self.assertIn("Writes: PAUSED", out)
+        self.assertIn("HTTP 503", out)
+
+    def test_reports_allowed_and_live_query_ids(self):
+        out = self.run_doctor([], {**SNAPSHOT, "fetched_at": time.time(), "operations": {
+            **SNAPSHOT["operations"],
+            **{name: {"queryId": f"live-{name}", "type": "mutation", "features": [], "fieldToggles": []}
+               for name in ("UnfavoriteTweet", "DeleteRetweet", "CreateBookmark", "DeleteBookmark")},
+        }})
+        self.assertIn("Writes: allowed", out)
+        self.assertIn("built-in ones are stale", out)
+
+    def test_missing_write_operation_pauses(self):
+        out = self.run_doctor([], {**SNAPSHOT, "fetched_at": time.time()})
+        self.assertIn("Writes: PAUSED", out)
+        self.assertIn("UnfavoriteTweet", out)
