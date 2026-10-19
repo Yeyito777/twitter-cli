@@ -211,6 +211,7 @@ def add_account(argv):
     from src.auth import add_credential_args, read_credentials, save_tokens, verify_identity
 
     p = argparse.ArgumentParser(
+        allow_abbrev=False,
         prog="twitter account add",
         description="Add a named Twitter/X login.",
         epilog="Example: twitter account add paramount --handle im_paramount --owner assistant --from-vimbrowser",
@@ -249,6 +250,7 @@ def migrate_legacy(argv):
     from src.notify import NOTIFICATION_SOURCE_ID, find_notify_pids
 
     p = argparse.ArgumentParser(
+        allow_abbrev=False,
         prog="twitter account migrate",
         description="Name the legacy single login, keeping its managed tweets and notification subscriptions.",
     )
@@ -284,7 +286,7 @@ def migrate_legacy(argv):
 
 
 def list_accounts(argv):
-    p = argparse.ArgumentParser(prog="twitter accounts", description="List configured Twitter accounts.")
+    p = argparse.ArgumentParser(allow_abbrev=False, prog="twitter accounts", description="List configured Twitter accounts.")
     p.parse_args(argv)
     registry = load_registry()
     if not registry["accounts"]:
@@ -304,7 +306,7 @@ def list_accounts(argv):
 
 
 def set_default(argv):
-    p = argparse.ArgumentParser(prog="twitter account default", description="Set the default account for reads.")
+    p = argparse.ArgumentParser(allow_abbrev=False, prog="twitter account default", description="Set the default account for reads.")
     p.add_argument("alias")
     args = p.parse_args(argv)
     alias = normalize_alias(args.alias)
@@ -321,6 +323,7 @@ def remove_account(argv):
     from src.notify import TOOL_NAME, notification_source
 
     p = argparse.ArgumentParser(
+        allow_abbrev=False,
         prog="twitter account remove",
         description="Remove an account's credentials, managed tweets, and notification subscriptions.",
     )

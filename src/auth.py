@@ -248,6 +248,7 @@ def verify_identity(tokens, *, handle):
 def login(argv):
     """Store fresh credentials for the selected account."""
     p = argparse.ArgumentParser(
+        allow_abbrev=False,
         prog="twitter login",
         description="Refresh the selected account's x.com login (pick one with -a/--account).",
     )
@@ -281,7 +282,7 @@ def login(argv):
 
 def logout(argv):
     """Remove the selected account's stored credentials."""
-    p = argparse.ArgumentParser(prog="twitter logout")
+    p = argparse.ArgumentParser(allow_abbrev=False, prog="twitter logout")
     p.parse_args(argv)
     path = credentials_file()
     if path.exists():

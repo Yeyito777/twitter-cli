@@ -15,7 +15,7 @@ from src.payload import read_stdin_text, reject_inline_text
 
 def timeline(argv):
     """Fetch and display the home timeline."""
-    p = argparse.ArgumentParser(prog="twitter timeline")
+    p = argparse.ArgumentParser(allow_abbrev=False, prog="twitter timeline")
     p.add_argument("-n", "--count", type=int, default=20, help="Number of tweets")
     p.add_argument("-c", "--cursor", type=str, help="Pagination cursor")
     p.add_argument("-l", "--latest", action="store_true", help="Chronological instead of algorithmic")
@@ -41,7 +41,7 @@ def timeline(argv):
 
 def tweet(argv):
     """View a single tweet by ID or URL."""
-    p = argparse.ArgumentParser(prog="twitter tweet")
+    p = argparse.ArgumentParser(allow_abbrev=False, prog="twitter tweet")
     p.add_argument("tweet", help="Tweet ID or URL")
     args = p.parse_args(argv)
 
@@ -66,7 +66,7 @@ def tweet(argv):
 
 def search(argv):
     """Search tweets by keyword, hashtag, or advanced query."""
-    p = argparse.ArgumentParser(prog="twitter search")
+    p = argparse.ArgumentParser(allow_abbrev=False, prog="twitter search")
     p.add_argument("query", nargs="+", help="Search query")
     p.add_argument("-n", "--count", type=int, default=20, help="Number of results")
     p.add_argument("-c", "--cursor", type=str, help="Pagination cursor")
@@ -110,7 +110,7 @@ def search(argv):
 
 def profile(argv):
     """View a user's profile info."""
-    p = argparse.ArgumentParser(prog="twitter profile")
+    p = argparse.ArgumentParser(allow_abbrev=False, prog="twitter profile")
     p.add_argument("user", help="Username (with or without @)")
     args = p.parse_args(argv)
 
@@ -161,7 +161,7 @@ def profile(argv):
 
 def tweets(argv):
     """View a user's tweets."""
-    p = argparse.ArgumentParser(prog="twitter tweets")
+    p = argparse.ArgumentParser(allow_abbrev=False, prog="twitter tweets")
     p.add_argument("user", help="Username (with or without @)")
     p.add_argument("-n", "--count", type=int, default=20, help="Number of tweets")
     p.add_argument("-c", "--cursor", type=str, help="Pagination cursor")
@@ -207,7 +207,7 @@ def tweets(argv):
 
 def thread(argv):
     """View a full thread/conversation around a tweet."""
-    p = argparse.ArgumentParser(prog="twitter thread")
+    p = argparse.ArgumentParser(allow_abbrev=False, prog="twitter thread")
     p.add_argument("tweet", help="Tweet ID or URL (any tweet in the thread)")
     args = p.parse_args(argv)
 
@@ -248,7 +248,7 @@ def thread(argv):
 
 def notifications(argv):
     """View recent notifications."""
-    p = argparse.ArgumentParser(prog="twitter notifications")
+    p = argparse.ArgumentParser(allow_abbrev=False, prog="twitter notifications")
     p.add_argument("-n", "--count", type=int, default=20, help="Number of notifications")
     p.add_argument("-c", "--cursor", type=str, help="Pagination cursor")
     args = p.parse_args(argv)
@@ -287,7 +287,7 @@ def notifications(argv):
 
 def bookmarks(argv):
     """List bookmarked tweets."""
-    p = argparse.ArgumentParser(prog="twitter bookmarks")
+    p = argparse.ArgumentParser(allow_abbrev=False, prog="twitter bookmarks")
     p.add_argument("-n", "--count", type=int, default=20, help="Number of bookmarks")
     p.add_argument("-c", "--cursor", type=str, help="Pagination cursor")
     args = p.parse_args(argv)
@@ -323,7 +323,7 @@ def bookmarks(argv):
 
 def trending(argv):
     """View trending topics."""
-    p = argparse.ArgumentParser(prog="twitter trending")
+    p = argparse.ArgumentParser(allow_abbrev=False, prog="twitter trending")
     p.add_argument("-n", "--count", type=int, default=20, help="Number of trends")
     args = p.parse_args(argv)
 
@@ -378,7 +378,7 @@ def trending(argv):
 
 def dms(argv):
     """List DM conversations."""
-    p = argparse.ArgumentParser(prog="twitter dms")
+    p = argparse.ArgumentParser(allow_abbrev=False, prog="twitter dms")
     args = p.parse_args(argv)
 
     data = rest_get("/1.1/dm/inbox_initial_state.json", DM_PARAMS)
@@ -447,6 +447,7 @@ def dms(argv):
 def dm(argv):
     """Read or send a DM in a conversation."""
     p = argparse.ArgumentParser(
+        allow_abbrev=False,
         prog="twitter dm",
         description="Read a DM conversation, or send exact stdin text with --send.",
         epilog="Inline DM text is not accepted. Stdin is read only when --send is present.",

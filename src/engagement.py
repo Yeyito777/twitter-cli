@@ -11,7 +11,7 @@ from src.helpers import Q, require_tweet_ref, resolve_user_id
 
 def like(argv):
     """Like a tweet."""
-    p = argparse.ArgumentParser(prog="twitter like")
+    p = argparse.ArgumentParser(allow_abbrev=False, prog="twitter like")
     p.add_argument("tweet", help="Tweet ID or URL")
     args = p.parse_args(argv)
 
@@ -22,7 +22,7 @@ def like(argv):
 
 def unlike(argv):
     """Unlike a tweet."""
-    p = argparse.ArgumentParser(prog="twitter unlike")
+    p = argparse.ArgumentParser(allow_abbrev=False, prog="twitter unlike")
     p.add_argument("tweet", help="Tweet ID or URL")
     args = p.parse_args(argv)
 
@@ -33,7 +33,7 @@ def unlike(argv):
 
 def rt(argv):
     """Retweet a tweet."""
-    p = argparse.ArgumentParser(prog="twitter rt")
+    p = argparse.ArgumentParser(allow_abbrev=False, prog="twitter rt")
     p.add_argument("tweet", help="Tweet ID or URL")
     args = p.parse_args(argv)
 
@@ -47,7 +47,7 @@ def rt(argv):
 
 def unrt(argv):
     """Undo a retweet."""
-    p = argparse.ArgumentParser(prog="twitter unrt")
+    p = argparse.ArgumentParser(allow_abbrev=False, prog="twitter unrt")
     p.add_argument("tweet", help="Tweet ID or URL")
     args = p.parse_args(argv)
 
@@ -61,7 +61,7 @@ def unrt(argv):
 
 def bookmark(argv):
     """Bookmark a tweet."""
-    p = argparse.ArgumentParser(prog="twitter bookmark")
+    p = argparse.ArgumentParser(allow_abbrev=False, prog="twitter bookmark")
     p.add_argument("tweet", help="Tweet ID or URL")
     args = p.parse_args(argv)
 
@@ -72,7 +72,7 @@ def bookmark(argv):
 
 def unbookmark(argv):
     """Remove a bookmark from a tweet."""
-    p = argparse.ArgumentParser(prog="twitter unbookmark")
+    p = argparse.ArgumentParser(allow_abbrev=False, prog="twitter unbookmark")
     p.add_argument("tweet", help="Tweet ID or URL")
     args = p.parse_args(argv)
 
@@ -94,7 +94,7 @@ def _user_action(args, endpoint, past_tense):
 
 def follow(argv):
     """Follow a user."""
-    p = argparse.ArgumentParser(prog="twitter follow")
+    p = argparse.ArgumentParser(allow_abbrev=False, prog="twitter follow")
     p.add_argument("user", help="Username (with or without @)")
     args = p.parse_args(argv)
     _user_action(args, "/1.1/friendships/create.json", "Followed")
@@ -102,7 +102,7 @@ def follow(argv):
 
 def unfollow(argv):
     """Unfollow a user."""
-    p = argparse.ArgumentParser(prog="twitter unfollow")
+    p = argparse.ArgumentParser(allow_abbrev=False, prog="twitter unfollow")
     p.add_argument("user", help="Username (with or without @)")
     args = p.parse_args(argv)
     _user_action(args, "/1.1/friendships/destroy.json", "Unfollowed")
@@ -110,7 +110,7 @@ def unfollow(argv):
 
 def mute(argv):
     """Mute a user."""
-    p = argparse.ArgumentParser(prog="twitter mute")
+    p = argparse.ArgumentParser(allow_abbrev=False, prog="twitter mute")
     p.add_argument("user", help="Username (with or without @)")
     args = p.parse_args(argv)
     _user_action(args, "/1.1/mutes/users/create.json", "Muted")
@@ -118,7 +118,7 @@ def mute(argv):
 
 def unmute(argv):
     """Unmute a user."""
-    p = argparse.ArgumentParser(prog="twitter unmute")
+    p = argparse.ArgumentParser(allow_abbrev=False, prog="twitter unmute")
     p.add_argument("user", help="Username (with or without @)")
     args = p.parse_args(argv)
     _user_action(args, "/1.1/mutes/users/destroy.json", "Unmuted")
@@ -126,7 +126,7 @@ def unmute(argv):
 
 def block(argv):
     """Block a user."""
-    p = argparse.ArgumentParser(prog="twitter block")
+    p = argparse.ArgumentParser(allow_abbrev=False, prog="twitter block")
     p.add_argument("user", help="Username (with or without @)")
     args = p.parse_args(argv)
     _user_action(args, "/1.1/blocks/create.json", "Blocked")
@@ -134,7 +134,7 @@ def block(argv):
 
 def unblock(argv):
     """Unblock a user."""
-    p = argparse.ArgumentParser(prog="twitter unblock")
+    p = argparse.ArgumentParser(allow_abbrev=False, prog="twitter unblock")
     p.add_argument("user", help="Username (with or without @)")
     args = p.parse_args(argv)
     _user_action(args, "/1.1/blocks/destroy.json", "Unblocked")

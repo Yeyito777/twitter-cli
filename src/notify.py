@@ -876,6 +876,7 @@ class NotifyDaemon:
 
 def _subscribe(argv, *, prog):
     p = argparse.ArgumentParser(
+        allow_abbrev=False,
         prog=prog,
         description="Subscribe an Exocortex conversation to managed-tweet replies and quotes.",
     )
@@ -911,6 +912,7 @@ def add(argv):
 
 def _unsubscribe(argv, *, prog):
     p = argparse.ArgumentParser(
+        allow_abbrev=False,
         prog=prog,
         description="Unsubscribe an Exocortex conversation from Twitter notifications.",
     )
@@ -942,7 +944,7 @@ def _listed_aliases():
 
 
 def list_config(argv):
-    p = argparse.ArgumentParser(prog="twitter notify list",
+    p = argparse.ArgumentParser(allow_abbrev=False, prog="twitter notify list",
         description="Show Exocortex subscriptions and Twitter polling configuration.")
     p.parse_args(argv)
 
@@ -991,7 +993,7 @@ def list_config(argv):
 
 
 def mark(argv):
-    p = argparse.ArgumentParser(prog="twitter notify mark",
+    p = argparse.ArgumentParser(allow_abbrev=False, prog="twitter notify mark",
         description="Mark one of your tweets as agent-managed so replies/quotes are relayed.")
     p.add_argument("tweet", help="Tweet ID or URL")
     args = p.parse_args(argv)
@@ -1005,7 +1007,7 @@ def mark(argv):
 
 
 def unmark(argv):
-    p = argparse.ArgumentParser(prog="twitter notify unmark",
+    p = argparse.ArgumentParser(allow_abbrev=False, prog="twitter notify unmark",
         description="Remove a tweet from the agent-managed relay allowlist.")
     p.add_argument("tweet", help="Tweet ID or URL")
     args = p.parse_args(argv)
@@ -1021,7 +1023,7 @@ def unmark(argv):
 
 
 def managed(argv):
-    p = argparse.ArgumentParser(prog="twitter notify managed",
+    p = argparse.ArgumentParser(allow_abbrev=False, prog="twitter notify managed",
         description="List tweets whose replies/quotes can be relayed.")
     p.add_argument("-n", "--count", type=int, default=50, help="Number of tweets to show")
     args = p.parse_args(argv)
@@ -1039,7 +1041,7 @@ def managed(argv):
 
 
 def start(argv):
-    p = argparse.ArgumentParser(prog="twitter notify start",
+    p = argparse.ArgumentParser(allow_abbrev=False, prog="twitter notify start",
         description="Start the supervised Twitter notification poller.")
     p.parse_args(argv)
 
@@ -1057,7 +1059,7 @@ def start(argv):
 
 
 def stop(argv):
-    p = argparse.ArgumentParser(prog="twitter notify stop",
+    p = argparse.ArgumentParser(allow_abbrev=False, prog="twitter notify stop",
         description="Stop the supervised Twitter notification poller.")
     p.parse_args(argv)
 
@@ -1078,6 +1080,7 @@ def _run_daemon(argv):
 
 def help_command(argv):
     p = argparse.ArgumentParser(
+        allow_abbrev=False,
         prog="twitter notify",
         description=(
             "Publish replies and quotes to agent-managed tweets through "

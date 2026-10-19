@@ -14,6 +14,7 @@ from src.payload import read_stdin_text, reject_inline_text
 def post(argv):
     """Post a new tweet, optionally as a reply or quote."""
     p = argparse.ArgumentParser(
+        allow_abbrev=False,
         prog="twitter post",
         description="Post a tweet using text read exactly from stdin.",
         epilog="Inline tweet text is not accepted; stdin is required.",
@@ -106,6 +107,7 @@ def _post_text(text, *, reply=None, quote=None):
 def reply(argv):
     """Reply to a tweet using exact text from stdin."""
     p = argparse.ArgumentParser(
+        allow_abbrev=False,
         prog="twitter reply",
         description="Reply to a tweet using text read exactly from stdin.",
         epilog="Inline reply text is not accepted; stdin is required.",
@@ -121,7 +123,7 @@ def reply(argv):
 
 def delete(argv):
     """Delete one of your own tweets."""
-    p = argparse.ArgumentParser(prog="twitter delete")
+    p = argparse.ArgumentParser(allow_abbrev=False, prog="twitter delete")
     p.add_argument("tweet", help="Tweet ID or URL")
     args = p.parse_args(argv)
 
