@@ -8,6 +8,7 @@ Run 'twitter account add' or 'twitter -a <alias> login' to configure.
 import argparse
 import getpass
 import json
+import os
 import subprocess
 import sys
 import urllib.parse
@@ -52,6 +53,7 @@ def get_tokens(alias=None):
         "auth_token": data.get("auth_token", ""),
         "ct0": data.get("ct0", ""),
         "bearer": BEARER_TOKEN,
+        "alias": alias,  # whose web-client snapshot signs these requests
     }
 
     missing = [k for k in ("auth_token", "ct0") if not tokens[k]]
@@ -133,6 +135,8 @@ def vimbrowser_credentials(*, handle=None, user_id=None):
         output = subprocess.run(
             ["vimbrowser-cli", "cookies", "--url", "https://x.com"],
             capture_output=True, text=True, check=True, timeout=30,
+            # Newer vimbrowser-cli omits cookie values unless asked; older ones ignore this.
+            env={**os.environ, "VIMBROWSER_CLI_COOKIE_VALUES": "1"},
         ).stdout
         cookies = {c["name"]: c["value"] for c in json.loads(output)["cookies"]}
     except (OSError, subprocess.SubprocessError, ValueError, KeyError) as e:
@@ -172,18 +176,17 @@ def vimbrowser_credentials(*, handle=None, user_id=None):
 
 
 def _issue_ct0(auth_token):
-    """Ask x.com for a CSRF token bound to this auth_token."""
-    import requests
-    from x_client_transaction.utils import generate_headers
+    """Ask x.com for a CSRF token bound to this auth_token (a page load, as the browser does)."""
+    from src import fingerprint, transport
 
-    session = requests.Session()
-    session.headers.update(generate_headers())
-    session.cookies.set("auth_token", auth_token, domain=".x.com", path="/")
-    session.get("https://x.com/home", timeout=30)
-    issued = [cookie.value for cookie in session.cookies if cookie.name == "ct0"]
+    response = transport.request(
+        "GET", "https://x.com/home",
+        headers=fingerprint.document_headers(cookie=f"auth_token={auth_token}"),
+    )
+    issued = response.cookies.get("ct0")
     if not issued:
         raise AccountError("x.com did not issue a ct0 for that login; it may have expired.")
-    return issued[-1]
+    return issued
 
 
 # ─── Identity ─────────────────────────────────────────────

@@ -4,11 +4,14 @@
 before any network I/O, so no command, flag spelling, or helper can reach X
 with a write unless:
 
-- the client fingerprint is healthy (see :func:`fingerprint_problem`); while it
-  is not, every write is paused because requests that do not look like the web
-  client are what gets accounts flagged and suspended;
 - the invocation named its account explicitly with ``-a/--account``;
-- the account has no lockout marker from an "automated"/locked response.
+- the account has no lockout marker from an "automated"/locked response;
+- the self-check passes (see :func:`self_check`): one coherent browser
+  identity, Chrome TLS/HTTP2 impersonation, and a live web-client snapshot
+  that yields an x-client-transaction-id and the operation's current query
+  ID.  While any of that is broken every write stays paused, because requests
+  that do not look like the web client are what gets accounts flagged and
+  suspended.
 
 Reads never pass through here.
 """
@@ -33,12 +36,30 @@ class WritePaused(RuntimeError):
     """A Twitter mutation was refused before anything was sent."""
 
 
-def fingerprint_problem():
-    """Return why writes must stay paused, or None when the client is healthy."""
-    return (
-        "the client fingerprint is being fixed (missing x-client-transaction-id "
-        "and an inconsistent browser identity raise suspension risk)"
-    )
+def self_check(tokens, operation=None):
+    """(problems, snapshot): why writes must stay paused (empty when healthy)."""
+    from src import fingerprint, transport, webclient
+
+    problems = list(fingerprint.identity_problems())
+    impersonation = transport.impersonation_problem()
+    if impersonation:
+        problems.append(impersonation)
+    snapshot = None
+    if "alias" not in tokens:
+        problems.append("credentials are not from a configured account")
+    else:
+        try:
+            snapshot = webclient.load(tokens, tokens["alias"])
+        except webclient.WebClientError as e:
+            problems.append(f"the live X web client could not be loaded ({e})")
+    if snapshot:
+        try:
+            webclient.transaction_id(snapshot, "POST", "/i/api/self-check")
+        except Exception as e:
+            problems.append(f"x-client-transaction-id cannot be generated ({e})")
+        if operation and not operation.startswith("/") and not webclient.operation(snapshot, operation):
+            problems.append(f"{operation} is not an operation of the live web client")
+    return problems, snapshot
 
 
 def _lockout_file(alias=None):
@@ -87,14 +108,11 @@ def clear_lockout(alias):
         return False
 
 
-def ensure_writes_allowed(operation):
-    """Raise WritePaused unless this invocation may send ``operation`` to X."""
-    problem = fingerprint_problem()
-    if problem:
-        raise WritePaused(
-            f"Twitter writes are paused: {problem}. Nothing was sent ({operation}). "
-            "Reading still works."
-        )
+def ensure_writes_allowed(operation, tokens):
+    """Raise WritePaused unless this invocation may send ``operation`` to X.
+
+    Returns the live web-client snapshot the write must be signed with.
+    """
     from src.accounts import ACCOUNT_EXPLICIT_ENV, load_registry
 
     if load_registry()["accounts"] and os.environ.get(ACCOUNT_EXPLICIT_ENV) != "1":
@@ -114,3 +132,10 @@ def ensure_writes_allowed(operation):
             f"{marker.get('operation')} with error {', '.join(map(str, marker.get('codes', [])))} "
             f"({marker.get('message', '')}). Nothing was sent ({operation})."
         )
+    problems, snapshot = self_check(tokens, operation)
+    if problems:
+        raise WritePaused(
+            f"Twitter writes are paused: the client self-check failed: {'; '.join(problems)}. "
+            f"Nothing was sent ({operation}). Reading still works; see 'twitter doctor'."
+        )
+    return snapshot

@@ -1,15 +1,22 @@
-"""Twitter/X internal API client — mirrors browser requests."""
+"""Twitter/X internal API client: requests exactly as the web client sends them.
+
+Every request presents one browser identity (``fingerprint``) over Chrome's
+TLS/HTTP2 (``transport``), signed with an x-client-transaction-id and using
+the query IDs and feature switches of the live web client (``webclient``).
+Writes additionally pass ``write_guard`` before anything is sent.
+"""
 
 import json
-import urllib.request
 import urllib.parse
-import urllib.error
+
+from src import fingerprint, transport, webclient
 from src.auth import get_tokens
 from src.write_guard import ensure_writes_allowed, record_write_error
 
+API_ORIGIN = "https://x.com"
 # Every request has a deadline: a stalled read must not hang a command, or the
 # notify daemon's single polling loop, forever.
-HTTP_TIMEOUT_SECONDS = 30
+HTTP_TIMEOUT_SECONDS = transport.TIMEOUT_SECONDS
 
 
 class TwitterAPIError(RuntimeError):
@@ -31,53 +38,6 @@ def error_codes(payload):
             codes.append(int(code))
     return codes
 
-
-def _http_error(e):
-    body = e.read().decode("utf-8", errors="replace")
-    try:
-        codes = error_codes(json.loads(body))
-    except (json.JSONDecodeError, ValueError):
-        codes = []
-    return TwitterAPIError(e.code, codes, body[:500])
-
-API_BASE = "https://x.com/i/api"
-API_BASE_V2 = "https://api.x.com"
-
-# Transaction ID generator — lazy-initialized, cached per process
-_ct = None
-
-
-def _get_transaction_generator():
-    """Initialize the ClientTransaction generator (fetches x.com homepage + ondemand JS).
-
-    This is expensive (~2 requests) so we cache it for the process lifetime.
-    """
-    global _ct
-    if _ct is not None:
-        return _ct
-
-    import requests as req_lib
-    import bs4
-    from x_client_transaction import ClientTransaction
-    from x_client_transaction.utils import generate_headers, get_ondemand_file_url
-
-    session = req_lib.Session()
-    session.headers = generate_headers()
-    home_page = session.get("https://x.com")
-    soup = bs4.BeautifulSoup(home_page.content, "html.parser")
-    ondemand_url = get_ondemand_file_url(response=soup)
-    ondemand_file = session.get(url=ondemand_url)
-    _ct = ClientTransaction(
-        home_page_response=soup,
-        ondemand_file_response=ondemand_file.text,
-    )
-    return _ct
-
-
-def _generate_txid(method, path):
-    """Generate a valid x-client-transaction-id for a given method + path."""
-    ct = _get_transaction_generator()
-    return ct.generate_transaction_id(method=method, path=path)
 
 # Feature flags required by most GraphQL endpoints (captured 2026-03-01)
 DEFAULT_FEATURES = {
@@ -120,98 +80,95 @@ DEFAULT_FEATURES = {
     "responsive_web_enhance_cards_enabled": False,
 }
 
-def _build_headers(tokens, method="GET", path=None):
-    headers = {
-        "Authorization": f"Bearer {tokens['bearer']}",
-        "x-csrf-token": tokens["ct0"],
-        "x-twitter-auth-type": "OAuth2Session",
-        "x-twitter-active-user": "yes",
-        "x-twitter-client-language": "en",
-        "Content-Type": "application/json",
-        "User-Agent": (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/134.0.0.0 Safari/537.36"
-        ),
-    }
-    if path:
-        try:
-            headers["x-client-transaction-id"] = _generate_txid(method, path)
-        except Exception:
-            # X periodically changes its frontend ondemand JS discovery. The
-            # authenticated API often still accepts requests without this
-            # browser-only anti-abuse header, so fail open rather than breaking
-            # all read/curation commands.
-            pass
-    return headers
+
+def _snapshot(tokens):
+    """The live web-client snapshot for these tokens' account, or None."""
+    if "alias" not in tokens:
+        return None  # credentials being verified before they are saved
+    try:
+        return webclient.load(tokens, tokens["alias"])
+    except webclient.WebClientError:
+        return None
 
 
-def _build_cookie_header(tokens):
-    return f"auth_token={tokens['auth_token']}; ct0={tokens['ct0']}"
+def _send(method, path, tokens, *, query=None, body=None, content_type="application/json",
+          referer=None, snapshot=None, allow_fallback=True):
+    """One request to x.com/i/api; returns parsed JSON or raises TwitterAPIError."""
+    txid = webclient.transaction_id(snapshot, method, path) if snapshot else None
+    url = API_ORIGIN + path + (f"?{urllib.parse.urlencode(query)}" if query else "")
+    headers = fingerprint.api_headers(
+        tokens, method=method, txid=txid, referer=referer, content_type=content_type,
+    )
+    response = transport.request(method, url, headers=headers, data=body, allow_fallback=allow_fallback)
+    text = response.text()
+    try:
+        data = json.loads(text) if text else {}
+    except ValueError:
+        data = None
+    if response.status >= 400:
+        raise TwitterAPIError(response.status, error_codes(data), text[:500])
+    if data is None:
+        raise TwitterAPIError(response.status, (), f"non-JSON response: {text[:200]}")
+    return data
+
+
+def _graphql(operation_name, query_hash, features, snapshot):
+    live = webclient.operation(snapshot, operation_name) if snapshot else None
+    if live:
+        return live
+    return query_hash, features or DEFAULT_FEATURES
 
 
 def graphql_get(query_hash, operation_name, variables, features=None, *, tokens=None):
     """Make an authenticated GET request to a Twitter GraphQL endpoint.
 
-    Uses the selected account unless explicit tokens are given.
-    Returns parsed JSON response.
+    Uses the selected account unless explicit tokens are given.  The live
+    client's query ID and features win over the hardcoded fallbacks.
     """
     tokens = tokens or get_tokens()
-
-    params = {
+    snapshot = _snapshot(tokens)
+    query_id, features = _graphql(operation_name, query_hash, features, snapshot)
+    query = {
         "variables": json.dumps(variables, separators=(",", ":")),
-        "features": json.dumps(
-            features or DEFAULT_FEATURES, separators=(",", ":")
-        ),
+        "features": json.dumps(features, separators=(",", ":")),
     }
-    path = f"/i/api/graphql/{query_hash}/{operation_name}"
-    url = f"https://x.com{path}?{urllib.parse.urlencode(params)}"
-
-    headers = _build_headers(tokens, method="GET", path=path)
-    headers["Cookie"] = _build_cookie_header(tokens)
-
-    req = urllib.request.Request(url, headers=headers, method="GET")
-
-    try:
-        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SECONDS) as resp:
-            return json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        raise _http_error(e) from None
+    return _send(
+        "GET", f"/i/api/graphql/{query_id}/{operation_name}", tokens, query=query,
+        referer=fingerprint.REFERERS.get(operation_name), snapshot=snapshot,
+    )
 
 
 def graphql_post(query_hash, operation_name, variables, features=None, *, tokens=None):
-    """Make an authenticated POST request to a Twitter GraphQL endpoint.
+    """Make an authenticated GraphQL mutation (a write).
 
     Returns parsed JSON response.
     """
-    ensure_writes_allowed(operation_name)
     tokens = tokens or get_tokens()
-
+    snapshot = ensure_writes_allowed(operation_name, tokens)
+    query_id, features = webclient.operation(snapshot, operation_name)
     body = json.dumps({
         "variables": variables,
-        "features": features or DEFAULT_FEATURES,
-        "queryId": query_hash,
+        "features": features,
+        "queryId": query_id,
     }, separators=(",", ":")).encode("utf-8")
-
-    path = f"/i/api/graphql/{query_hash}/{operation_name}"
-    url = f"https://x.com{path}"
-
-    headers = _build_headers(tokens, method="POST", path=path)
-    headers["Cookie"] = _build_cookie_header(tokens)
-
-    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
-    return _send_write(req, operation_name)
+    return _send_write(
+        "POST", f"/i/api/graphql/{query_id}/{operation_name}", tokens, operation_name,
+        body=body, snapshot=snapshot,
+    )
 
 
-def _send_write(req, operation):
+def _send_write(method, path, tokens, operation, **kwargs):
     """Send one write; X errors (even with HTTP 200) raise, and may pause writes."""
     try:
-        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SECONDS) as resp:
-            data = json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        error = _http_error(e)
+        data = _send(method, path, tokens, allow_fallback=False, **kwargs)
+    except TwitterAPIError as error:
         record_write_error(error.codes, str(error), operation)
-        raise error from None
+        raise
+    except OSError as error:
+        raise TwitterAPIError(
+            0, (), f"Outcome unknown: the connection failed during {operation} ({error}); "
+                   "X may have applied it. Check before retrying."
+        ) from error
     if isinstance(data, dict) and data.get("errors"):
         codes = error_codes(data)
         messages = "; ".join(
@@ -229,46 +186,26 @@ def rest_get(endpoint, params=None, *, tokens=None):
     Returns parsed JSON response.
     """
     tokens = tokens or get_tokens()
-
-    path = f"/i/api{endpoint}"
-    url = f"https://x.com{path}"
-    if params:
-        url += "?" + urllib.parse.urlencode(params)
-
-    headers = _build_headers(tokens, method="GET", path=path)
-    headers["Cookie"] = _build_cookie_header(tokens)
-
-    req = urllib.request.Request(url, headers=headers, method="GET")
-
-    try:
-        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SECONDS) as resp:
-            return json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        raise _http_error(e) from None
+    return _send("GET", f"/i/api{endpoint}", tokens, query=params, snapshot=_snapshot(tokens))
 
 
 def rest_post(endpoint, body=None, form=False, *, tokens=None):
-    """Make an authenticated POST request to a Twitter REST endpoint.
+    """Make an authenticated POST request to a Twitter REST endpoint (a write).
 
     If form=True, sends body as x-www-form-urlencoded instead of JSON.
     This is required for legacy v1.1 endpoints like friendships/create.
     """
-    ensure_writes_allowed(endpoint)
     tokens = tokens or get_tokens()
-
-    path = f"/i/api{endpoint}"
-    url = f"https://x.com{path}"
-
-    headers = _build_headers(tokens, method="POST", path=path)
-    headers["Cookie"] = _build_cookie_header(tokens)
-
+    snapshot = ensure_writes_allowed(endpoint, tokens)
+    content_type = "application/json"
     if form and body:
         data = urllib.parse.urlencode(body).encode("utf-8")
-        headers["Content-Type"] = "application/x-www-form-urlencoded"
+        content_type = "application/x-www-form-urlencoded"
     elif body:
         data = json.dumps(body, separators=(",", ":")).encode("utf-8")
     else:
         data = None
-
-    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
-    return _send_write(req, endpoint)
+    return _send_write(
+        "POST", f"/i/api{endpoint}", tokens, endpoint, body=data,
+        content_type=content_type, snapshot=snapshot,
+    )

@@ -8,17 +8,14 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from src import accounts, api, engagement, posting, reading, write_guard
+from src import accounts, api, engagement, posting, reading, webclient, write_guard
+from tests.helpers import SNAPSHOT, response as _api_response
 
 MAIN = {"user_id": "100", "screen_name": "main_user", "name": "Main", "owner": "user"}
 
 
-def _response(payload):
-    response = Mock()
-    response.read.return_value = json.dumps(payload).encode()
-    response.__enter__ = Mock(return_value=response)
-    response.__exit__ = Mock(return_value=False)
-    return response
+def _response(payload, status=200):
+    return _api_response(payload, status)
 
 
 class _Unpaused(unittest.TestCase):
@@ -33,10 +30,9 @@ class _Unpaused(unittest.TestCase):
             {"version": 1, "default_account": "main", "accounts": {"main": MAIN}}))
         for item in (
             patch.object(accounts, "CONFIG_ROOT", root),
-            patch.object(write_guard, "fingerprint_problem", return_value=None),
+            patch.object(webclient, "load", return_value=SNAPSHOT),
             patch.dict(os.environ, {accounts.ACCOUNT_ENV: "main", accounts.ACCOUNT_EXPLICIT_ENV: "1"}),
-            patch.object(api, "get_tokens", return_value={"auth_token": "a", "ct0": "c", "bearer": "b"}),
-            patch.object(api, "_generate_txid", return_value="tx"),
+            patch.object(api, "get_tokens", return_value={"auth_token": "a", "ct0": "c", "bearer": "b", "alias": "main"}),
         ):
             item.start()
             self.addCleanup(item.stop)
@@ -45,7 +41,7 @@ class _Unpaused(unittest.TestCase):
 class ExplicitAccountTests(_Unpaused):
     def test_write_without_explicit_account_is_refused_at_send_time(self):
         os.environ.pop(accounts.ACCOUNT_EXPLICIT_ENV)
-        with patch.object(api.urllib.request, "urlopen") as urlopen:
+        with patch.object(api.transport, "request") as urlopen:
             with self.assertRaisesRegex(write_guard.WritePaused, "explicit account"):
                 api.graphql_post("q", "FavoriteTweet", {"tweet_id": "1"})
         urlopen.assert_not_called()
@@ -56,7 +52,7 @@ class FalseSuccessTests(_Unpaused):
         stdout = io.StringIO()
         error = {"errors": [{"code": 139, "message": "You have already favorited this post."}]}
         with (
-            patch.object(api.urllib.request, "urlopen", return_value=_response(error)),
+            patch.object(api.transport, "request", return_value=_response(error)),
             contextlib.redirect_stdout(stdout),
             self.assertRaisesRegex(api.TwitterAPIError, "already favorited"),
         ):
@@ -66,7 +62,7 @@ class FalseSuccessTests(_Unpaused):
     def test_failed_delete_keeps_the_managed_tweet_record(self):
         error = {"errors": [{"code": 144, "message": "No status found with that ID."}]}
         with (
-            patch.object(api.urllib.request, "urlopen", return_value=_response(error)),
+            patch.object(api.transport, "request", return_value=_response(error)),
             patch.object(posting, "unrecord_agent_tweet") as unrecord,
             self.assertRaises(api.TwitterAPIError),
         ):
@@ -75,7 +71,7 @@ class FalseSuccessTests(_Unpaused):
 
     def test_automated_answer_pauses_all_further_writes(self):
         flagged = {"errors": [{"code": 226, "message": "This request looks like it might be automated."}]}
-        with patch.object(api.urllib.request, "urlopen", return_value=_response(flagged)) as urlopen:
+        with patch.object(api.transport, "request", return_value=_response(flagged)) as urlopen:
             with self.assertRaises(api.TwitterAPIError):
                 api.graphql_post("q", "CreateTweet", {"tweet_text": "x"})
             with self.assertRaisesRegex(write_guard.WritePaused, "226"):
@@ -92,10 +88,8 @@ class FalseSuccessTests(_Unpaused):
             self.assertIsNone(write_guard.active_lockout())
 
     def test_http_error_codes_also_pause(self):
-        import urllib.error
-        body = json.dumps({"errors": [{"code": 326, "message": "locked"}]}).encode()
-        error = urllib.error.HTTPError("https://x.com", 403, "Forbidden", {}, io.BytesIO(body))
-        with patch.object(api.urllib.request, "urlopen", side_effect=error):
+        error = _response({"errors": [{"code": 326, "message": "locked"}]}, status=403)
+        with patch.object(api.transport, "request", return_value=error):
             with self.assertRaises(api.TwitterAPIError):
                 api.rest_post("/1.1/friendships/create.json", {"user_id": "1"}, form=True)
         self.assertEqual(write_guard.active_lockout()["codes"], [326])
