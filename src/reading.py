@@ -140,9 +140,10 @@ def profile(argv):
     handle = user_core.get("screen_name") or user_legacy.get("screen_name", "?")
     verified = user_result.get("is_blue_verified", False)
 
-    followers = user_legacy.get("followers_count", 0)
-    following = user_legacy.get("friends_count", 0)
-    tweets_count = user_legacy.get("statuses_count", 0)
+    relationship_counts = user_result.get("relationship_counts", {})
+    followers = relationship_counts.get("followers", user_legacy.get("followers_count", 0))
+    following = relationship_counts.get("following", user_legacy.get("friends_count", 0))
+    tweets_count = user_result.get("tweet_counts", {}).get("tweets", user_legacy.get("statuses_count", 0))
     created = user_core.get("created_at", "")
 
     v_mark = " ✓" if verified else ""
