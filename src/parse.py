@@ -120,15 +120,19 @@ def parse_notification(item):
     icon = item.get("notification_icon", "")
     timestamp_ms = item.get("timestamp_ms", "")
 
-    # Parse timestamp
+    # X sends epoch milliseconds or, now, an ISO 8601 string ("2026-11-08T11:25:45.821Z").
     created_at = ""
     if timestamp_ms:
+        from datetime import datetime, timezone
         try:
-            from datetime import datetime, timezone
             dt = datetime.fromtimestamp(int(timestamp_ms) / 1000, tz=timezone.utc)
-            created_at = dt.strftime("%Y-%m-%d %H:%M")
         except (ValueError, TypeError, OSError):
-            pass
+            try:
+                dt = datetime.fromisoformat(str(timestamp_ms).replace("Z", "+00:00")).astimezone(timezone.utc)
+            except ValueError:
+                dt = None
+        if dt:
+            created_at = dt.strftime("%Y-%m-%d %H:%M")
 
     # Map icon names to emoji
     icon_map = {
