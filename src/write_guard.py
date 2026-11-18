@@ -8,8 +8,9 @@ with a write unless:
 - the account has no lockout marker from an "automated"/locked response;
 - the self-check passes (see :func:`self_check`): one coherent browser
   identity, Chrome TLS/HTTP2 impersonation, and a live web-client snapshot
-  that yields an x-client-transaction-id and the operation's current query
-  ID.  While any of that is broken every write stays paused, because requests
+  that yields an x-client-transaction-id and shows how the live client sends
+  this operation (its query ID, or for X's new x-web client, a write this
+  tool has been ported to).  While any of that is broken every write stays paused, because requests
   that do not look like the web client are what gets accounts flagged and
   suspended.
 
@@ -57,8 +58,9 @@ def self_check(tokens, operation=None):
             webclient.transaction_id(snapshot, "POST", "/i/api/self-check")
         except Exception as e:
             problems.append(f"x-client-transaction-id cannot be generated ({e})")
-        if operation and not operation.startswith("/") and not webclient.operation(snapshot, operation):
-            problems.append(f"{operation} is not an operation of the live web client")
+        problem = webclient.write_problem(snapshot, operation) if operation else None
+        if problem:
+            problems.append(problem)
     return problems, snapshot
 
 

@@ -31,6 +31,8 @@ IMPERSONATE = "chrome146"
 
 ORIGIN = "https://x.com"
 DEFAULT_REFERER = "https://x.com/home"
+# x.com pages calling api.x.com: Chrome trims a cross-origin Referer to the origin.
+CROSS_ORIGIN_REFERER = "https://x.com/"
 # The page a real session would be on when it makes each request.
 REFERERS = {
     "NotificationsTimeline": "https://x.com/notifications",
@@ -41,8 +43,13 @@ REFERERS = {
 }
 
 
-def api_headers(tokens, *, method, txid=None, referer=None, content_type="application/json"):
-    """Headers for an x.com/i/api request, in the order Chrome sends them."""
+def api_headers(tokens, *, method, txid=None, referer=None, content_type="application/json",
+                site="same-origin"):
+    """Headers for an API request from an x.com page, in the order Chrome sends them.
+
+    ``site`` is "same-origin" for x.com/i/api and "same-site" for api.x.com,
+    where the x-web client sends its calls (CORS: Origin on every method).
+    """
     headers = [
         ("sec-ch-ua-platform", SEC_CH_UA_PLATFORM),
         ("authorization", f"Bearer {tokens['bearer']}"),
@@ -60,19 +67,56 @@ def api_headers(tokens, *, method, txid=None, referer=None, content_type="applic
         ("x-twitter-auth-type", "OAuth2Session"),
         ("accept", "*/*"),
     ]
-    if method.upper() != "GET":
+    if method.upper() != "GET" or site != "same-origin":
         headers.append(("origin", ORIGIN))  # same-origin GETs carry no Origin
     headers += [
-        ("sec-fetch-site", "same-origin"),
+        ("sec-fetch-site", site),
         ("sec-fetch-mode", "cors"),
         ("sec-fetch-dest", "empty"),
-        ("referer", referer or DEFAULT_REFERER),
+        ("referer", CROSS_ORIGIN_REFERER if site != "same-origin" else referer or DEFAULT_REFERER),
         ("accept-encoding", ACCEPT_ENCODING),
         ("accept-language", ACCEPT_LANGUAGE),
         ("cookie", cookie_header(tokens)),
         ("priority", "u=1, i"),
     ]
     return headers
+
+
+def preflight_headers(*, method, headers):
+    """The CORS preflight Chrome sends before the api.x.com request ``headers`` (no cookies)."""
+    return [
+        ("accept", "*/*"),
+        ("access-control-request-method", method.upper()),
+        ("access-control-request-headers", ",".join(sorted(_unsafe_header_names(headers)))),
+        ("origin", ORIGIN),
+        ("user-agent", USER_AGENT),
+        ("sec-fetch-mode", "cors"),
+        ("sec-fetch-site", "same-site"),
+        ("sec-fetch-dest", "empty"),
+        ("referer", CROSS_ORIGIN_REFERER),
+        ("accept-encoding", ACCEPT_ENCODING),
+        ("accept-language", ACCEPT_LANGUAGE),
+        ("priority", "u=1, i"),
+    ]
+
+
+# Headers a preflight does not announce: CORS-safelisted ones, and those the
+# browser sets itself.
+_SAFELISTED = {"accept", "accept-language", "content-language"}
+_SAFELISTED_TYPES = {"application/x-www-form-urlencoded", "multipart/form-data", "text/plain"}
+_FORBIDDEN = {"user-agent", "origin", "referer", "accept-encoding", "cookie", "priority"}
+
+
+def _unsafe_header_names(headers):
+    names = []
+    for name, value in headers:
+        lower = name.lower()
+        if lower in _SAFELISTED or lower in _FORBIDDEN or lower.startswith("sec-"):
+            continue
+        if lower == "content-type" and value.split(";")[0].strip().lower() in _SAFELISTED_TYPES:
+            continue
+        names.append(lower)
+    return names
 
 
 def document_headers(*, cookie=None):

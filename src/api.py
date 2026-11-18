@@ -7,6 +7,7 @@ Writes additionally pass ``write_guard`` before anything is sent.
 """
 
 import json
+import time
 import urllib.parse
 
 from src import fingerprint, transport, webclient
@@ -92,13 +93,18 @@ def _snapshot(tokens):
 
 
 def _send(method, path, tokens, *, query=None, body=None, content_type="application/json",
-          referer=None, snapshot=None, allow_fallback=True):
-    """One request to x.com/i/api; returns parsed JSON or raises TwitterAPIError."""
+          referer=None, snapshot=None, allow_fallback=True, url=None, site="same-origin"):
+    """One API request; returns parsed JSON or raises TwitterAPIError.
+
+    ``path`` is signed into the transaction ID; ``url`` defaults to x.com + path.
+    """
     txid = webclient.transaction_id(snapshot, method, path) if snapshot else None
-    url = API_ORIGIN + path + (f"?{urllib.parse.urlencode(query)}" if query else "")
+    url = (url or API_ORIGIN + path) + (f"?{urllib.parse.urlencode(query)}" if query else "")
     headers = fingerprint.api_headers(
-        tokens, method=method, txid=txid, referer=referer, content_type=content_type,
+        tokens, method=method, txid=txid, referer=referer, content_type=content_type, site=site,
     )
+    if site != "same-origin":
+        _preflight(method, url, headers, tokens)
     response = transport.request(method, url, headers=headers, data=body, allow_fallback=allow_fallback)
     text = response.text()
     try:
@@ -138,23 +144,66 @@ def graphql_get(query_hash, operation_name, variables, features=None, *, tokens=
     )
 
 
+# Chrome caches a CORS preflight for at most two hours (api.x.com allows 20 days).
+PREFLIGHT_TTL = 2 * 60 * 60
+
+
+def _preflight_file(tokens):
+    from src.accounts import account_dir
+
+    return account_dir(tokens.get("alias")) / "preflight.json"
+
+
+def _preflight(method, url, headers, tokens):
+    """Send the CORS preflight a browser would, unless one is still cached."""
+    path = _preflight_file(tokens)
+    try:
+        cache = json.loads(path.read_text())
+    except (OSError, ValueError):
+        cache = {}
+    now = time.time()
+    cache = {key: until for key, until in cache.items() if isinstance(until, (int, float)) and until > now}
+    key = f"{method.upper()} {url}"
+    if key in cache:
+        return
+    try:
+        response = transport.request(
+            "OPTIONS", url, headers=fingerprint.preflight_headers(method=method, headers=headers),
+            allow_fallback=False,
+        )
+    except OSError as error:
+        raise TwitterAPIError(0, (), f"CORS preflight failed ({error}); nothing was sent") from error
+    if not 200 <= response.status < 300:
+        raise TwitterAPIError(response.status, (), "CORS preflight refused; nothing was sent")
+    cache[key] = now + PREFLIGHT_TTL
+    try:
+        from src.accounts import write_secure_json
+
+        write_secure_json(path, cache)
+    except OSError:
+        pass
+
+
 def graphql_post(query_hash, operation_name, variables, features=None, *, tokens=None):
-    """Make an authenticated GraphQL mutation (a write).
+    """Make an authenticated GraphQL mutation (a write), as the live client sends it.
 
     Returns parsed JSON response.
     """
     tokens = tokens or get_tokens()
     snapshot = ensure_writes_allowed(operation_name, tokens)
-    query_id, features = webclient.operation(snapshot, operation_name)
-    body = json.dumps({
-        "variables": variables,
-        "features": features,
-        "queryId": query_id,
-    }, separators=(",", ":")).encode("utf-8")
-    return _send_write(
-        "POST", f"/i/api/graphql/{query_id}/{operation_name}", tokens, operation_name,
-        body=body, snapshot=snapshot,
+    request = webclient.write_request(snapshot, operation_name, variables)
+    body = json.dumps(request["body"], separators=(",", ":")).encode("utf-8")
+    data = _send_write(
+        "POST", request["path"], tokens, operation_name,
+        body=body, snapshot=snapshot, url=request["url"], site=request["site"],
     )
+    field = request["field"]
+    if field and ((data.get("data") if isinstance(data, dict) else None) or {}).get(field) is None:
+        raise TwitterAPIError(
+            200, (), f"Outcome unclear: X's answer to {operation_name} has no {field} "
+                     f"({json.dumps(data)[:200]}); check before retrying."
+        )
+    return data
 
 
 def _send_write(method, path, tokens, operation, **kwargs):
@@ -205,7 +254,14 @@ def rest_post(endpoint, body=None, form=False, *, tokens=None):
         data = json.dumps(body, separators=(",", ":")).encode("utf-8")
     else:
         data = None
-    return _send_write(
-        "POST", f"/i/api{endpoint}", tokens, endpoint, body=data,
-        content_type=content_type, snapshot=snapshot,
+    request = webclient.rest_write_request(snapshot, endpoint)
+    answer = _send_write(
+        "POST", request["path"], tokens, endpoint, body=data,
+        content_type=content_type, snapshot=snapshot, url=request["url"], site=request["site"],
     )
+    if request["site"] != "same-origin" and not (isinstance(answer, dict) and answer.get("id_str")):
+        raise TwitterAPIError(
+            200, (), f"Outcome unclear: X's answer to {endpoint} has no id_str "
+                     f"({json.dumps(answer)[:200]}); check before retrying."
+        )
+    return answer

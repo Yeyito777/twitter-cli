@@ -39,9 +39,15 @@ def doctor(argv):
     problems, snapshot = self_check(tokens)
     if snapshot:
         age = int(time.time() - snapshot["fetched_at"])
-        print(f"  Web client: {snapshot['client']} (loaded {age // 60} min ago), "
+        print(f"  Web client: {snapshot['client']} ({webclient.layout(snapshot)}, loaded {age // 60} min ago), "
               f"{len(snapshot['operations'])} operations")
-        missing = [name for name in WRITE_OPERATIONS if not webclient.operation(snapshot, name)]
+        if webclient.layout(snapshot) == "client-web":
+            missing = [name for name in WRITE_OPERATIONS if webclient.write_problem(snapshot, name)]
+        else:
+            ported = [*webclient.XWEB_MUTATIONS, *webclient.XWEB_REST_WRITES]
+            missing = [name for name in ported if webclient.write_problem(snapshot, name)]
+            unported = [name for name in WRITE_OPERATIONS if name not in webclient.XWEB_MUTATIONS]
+            print(f"  Not yet sent the new client's way (paused): {', '.join(unported)}, DMs")
         if missing:
             problems.append(f"write operations missing from the live client: {', '.join(missing)}")
         drift = sorted(name for name, query_id in Q.items()
